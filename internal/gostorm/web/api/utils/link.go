@@ -32,6 +32,7 @@ func ParseFile(file multipart.File) (*torrent.TorrentSpec, error) {
 		Trackers:    [][]string{mag.Trackers},
 		DisplayName: info.Name,
 		InfoHash:    minfo.HashInfoBytes(),
+		Webseeds:    minfo.UrlList,
 	}, nil
 }
 
@@ -72,6 +73,7 @@ func fromMagnet(link string) (*torrent.TorrentSpec, error) {
 		Trackers:    trackers,
 		DisplayName: mag.DisplayName,
 		InfoHash:    mag.InfoHash,
+		Webseeds:    mag.Params["ws"],
 	}, nil
 }
 
@@ -137,6 +139,7 @@ func fromHttp(link string) (*torrent.TorrentSpec, error) {
 		Trackers:    [][]string{mag.Trackers},
 		DisplayName: info.Name,
 		InfoHash:    minfo.HashInfoBytes(),
+		Webseeds:    minfo.UrlList,
 	}, nil
 }
 
@@ -160,5 +163,6 @@ func fromFile(path string) (*torrent.TorrentSpec, error) {
 		Trackers:    [][]string{mag.Trackers},
 		DisplayName: info.Name,
 		InfoHash:    minfo.HashInfoBytes(),
+		Webseeds:    minfo.UrlList,
 	}, nil
 }
