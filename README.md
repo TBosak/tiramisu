@@ -50,6 +50,19 @@ automatically: a 1080p entry becomes 4K HDR without anyone asking. TV series
 follow the same path, fullpack-first, in a Plex-compatible folder layout. Add a
 title to your Plex cloud watchlist and it shows up within the hour.
 
+**Your music and audiobooks ride the same filesystem.** `music/` and
+`audiobooks/` sit next to `movies/` and `tv/` under the same mount, served by the
+same FUSE layer and filed through the same Library API. An album is added by
+exact path with a caller-supplied MusicBrainz or ASIN identity
+(`external_id` + `external_id_ns`), which is stored in the SQLite projection
+registry and written into the virtual file, so a release keeps a real identity
+instead of a filename guess. Audio projections are immutable and read-only to
+their clients: files answer `0444`, directories `0555`, and the mutations a
+scanner never needs (write open, truncate, rename, mkdir, chmod) are refused
+with `EROFS`, while a direct unlink gets `EPERM`. Playback is served live from
+the swarm exactly like video, so Plex and Plexamp index and play a lossless
+album that occupies no disk. FLAC for music; M4B, M4A and MP3 for audiobooks.
+
 **Playback quality is the reason for the rest.** These pieces exist to turn an
 unpredictable swarm into something a media player can trust:
 
@@ -77,7 +90,8 @@ install the `iptables REDIRECT` rules, all without a restart. The **peer
 blocklist** is optional and off by default; when enabled it is downloaded at
 startup, refreshed every 24 hours, and injected into the engine before any
 connection is made. A **Library API** (`/api/library/add`, `/remove`, `/list`)
-lets any HTTP client file or remove a title without touching the filesystem, and
+lets any HTTP client file or remove a title, movies, series, music and
+audiobooks alike, without touching the filesystem, and
 `hermes/SKILL.md` is the ready-made skill that teaches an AI agent to use it.
 All of it, engine included, ships as a single `tiramisu` binary.
 
@@ -324,6 +338,25 @@ Jellyfin's own event names and item types are mapped onto Tiramisu's internally
 (`PlaybackStart`→`media.play`, `PlaybackStop`→`media.stop`, `Movie`→`movie`,
 `Episode`→`show`), so neither side needs a code change or a plugin hack.
 
+**Music** uses the same endpoint with a different identity: a track has no IMDb id,
+so Tiramisu matches on the MusicBrainz id the projection was filed with. **Plex and
+Plexamp** need no extra configuration: play an album and the log shows
+`[PLEX] Playback confirmed by webhook for: <file>.flac`. **Jellyfin** needs a second
+Generic destination (Jellyfin 10.11 requires plugin 18 or later, 10.10 requires 16
+or later, current is 22) with the same URL and events and this body:
+
+```
+{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{Artist}}}","librarySectionType":"{{ItemType}}","ProviderIds":{"MusicBrainzTrack":"{{Provider_musicbrainztrack}}","MusicBrainzReleaseGroup":"{{Provider_musicbrainzreleasegroup}}","MusicBrainzAlbum":"{{Provider_musicbrainzalbum}}","MusicBrainzArtist":"{{Provider_musicbrainzartist}}"}}}
+```
+
+Plex sends the release track id, Jellyfin the recording id (the `MUSICBRAINZ_TRACKID`
+tag, exposed as `MusicBrainzTrack`). The id style follows the Plex/Jellyfin switch in
+the Control Panel, so a library must be filed with the style of the player that
+actually plays it, and switching player afterwards means re-filing it with an align
+run in the new style. Jellyfin exposes MusicBrainz providers only when the files
+carry MusicBrainz tags: tagless files still play, but their webhook has no id to
+match and the session falls back to inferred playback.
+
 ### 4. Adaptive Shield
 
 Two read modes, managed automatically:
@@ -561,6 +594,12 @@ http://192.168.1.2:9080/plex/webhook
 - Template:
 ```
 {"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
+```
+
+Music needs a second Generic destination with its own template, same URL and events:
+
+```
+{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{Artist}}}","librarySectionType":"{{ItemType}}","ProviderIds":{"MusicBrainzTrack":"{{Provider_musicbrainztrack}}","MusicBrainzReleaseGroup":"{{Provider_musicbrainzreleasegroup}}","MusicBrainzAlbum":"{{Provider_musicbrainzalbum}}","MusicBrainzArtist":"{{Provider_musicbrainzartist}}"}}}
 ```
 
 Test connectivity:
@@ -1116,6 +1155,61 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 Removing a stub drops its torrent only when no other stub still points at it:
 one season pack is a single torrent behind many episodes.
+
+### Music and audiobooks (v1.10.0)
+
+`music/` and `audiobooks/` use the same endpoints with their own rules. The caller
+supplies the final path and Tiramisu validates what the engine owns: section
+containment, extension agreement, the mandatory `_<hash8>` suffix (the last eight
+hex digits of the infohash, before the extension) and collision rules. Music admits
+`.flac` only; audiobooks admit `.m4b`, `.m4a` and `.mp3`.
+
+```bash
+# 1. Inspect hydrates the magnet and returns the file list. The engine adds the
+# torrent itself, so a magnet is enough; metadata_wait works as in add.
+curl -s -X POST -H 'Content-Type: application/json' --max-time 300 \
+  -d '{"magnet":"magnet:?xt=urn:btih:...","title":"Dummy Album"}' \
+  http://127.0.0.1:9080/api/library/inspect
+
+# 2. Add an album, one projection per file. external_id is the caller's identity
+# (a MusicBrainz release group, an ASIN) and external_id_ns its namespace: it is
+# stored verbatim, written into the stub, and returned by list.
+curl -s -X POST -H 'Content-Type: application/json' --max-time 300 \
+  -d '{"type":"music","hash":"<infohash>","title":"Dummy Album",
+       "files":[{"source_path":"Release/01 - One.flac",
+                 "path":"Artist/Album/01 - One_e7f8a9b0.flac",
+                 "external_id":"<release-group-mbid>","external_id_ns":"musicbrainz"}]}' \
+  http://127.0.0.1:9080/api/library/add
+
+# 3. List pages instead of returning an array, and shows the identity per row.
+# prefix filters the section; failures=1 adds the reachability counters.
+curl -s 'http://127.0.0.1:9080/api/library/list?type=music&limit=200' | \
+  jq '{next_cursor, items: [.items[] | {path, external_id, external_id_ns}]}'
+curl -s 'http://127.0.0.1:9080/api/library/list?type=music&prefix=Artist/Album&failures=1'
+
+# 4. Remove one projection by exact path, or a whole album by prefix.
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"type":"music","path":"Artist/Album/01 - One_e7f8a9b0.flac"}' \
+  http://127.0.0.1:9080/api/library/remove
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"type":"music","prefix":"Artist/Album"}' \
+  http://127.0.0.1:9080/api/library/remove
+```
+
+`add` answers `201` for the projections it created, or `200` with
+`"already_present": true` when they are already filed. On a replay the stored
+identity wins and a disagreement is logged, so changing an identity means removing
+and adding again. `remove` is idempotent: an absent path answers `removed: false`
+with `state: "absent"`. Prefix removal takes a whole album in one call and answers
+`409` when the rows under it do not share exactly one torrent, which is the engine
+saying that directory is not an album. `blacklist` is not audio lifecycle state and
+is rejected. Hash-wide, directory and batch removal remain out of Phase 1. A
+torrent is never dropped while another projection still references it.
+
+Projections are read-only to their clients: files answer `0444`, directories
+`0555`, and the mutations a scanner never needs (write open, truncate, rename,
+mkdir, chmod) are refused with `EROFS`, while a direct unlink gets `EPERM`. Adding,
+re-filing and removing happen only through the API.
 
 ### Episode gaps (v1.9.71)
 
