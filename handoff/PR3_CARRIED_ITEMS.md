@@ -12,10 +12,11 @@ re-derive any of it.
 |---|------|--------|-------|
 | 1 | Staged transaction crash recovery | **done** | `2111423`, rollback-only, wired in `startup.go` |
 | 2 | `resolveTargetFile` hot-path cost | **done** | `e0beb0c`, the audio branch skips the engine file-list copy |
-| 3 | External identity on replay | **open — decision required** | unchanged: the stored row wins and the disagreement is logged |
+| 3 | External identity on replay | **done — documented** | decided 2026-09-22: stored row wins, disagreement logged; written into the API contract, no code change |
 | 4 | `Remove` does not unpublish | **done** | `8da6d99`, mark → unpublish → unlink → prune → forget, exact path only |
 | 5 | `WriteAudioStub` unreachable | **done** | `db7dfd7`, deleted; `AudioStubBytes` + `SectionWriter` is the only writer |
 | 6 | Directory fsync after rename | **done** | `2dcc000`, both directories, `EINVAL`/`ENOTSUP` tolerated on the fallback |
+| 7 | Album-granular removal | **done** | `840e8bf` prefix removal with resume, `89bc294` skips albums with an open playback session |
 
 ### PR 3 roadmap status (2026-09-21, branch `feature/audio-projection`)
 
@@ -36,8 +37,8 @@ requested per point.
 | §9 complete successful readdir | done | committed namespace published as one batch (`284aac2`), DirCache generation test |
 | §10 EOF/short-read | done | `startup_read_failure_test.go` (EOF, stalled deadline, absent stream) |
 | §11 scanner-safe blocking reads | done | same read path, single injected deadline; `793f89a` bounds the wake by the FUSE context |
-| §12 concurrency/fairness measurement | **pending** | Pi 4 reference workload: 4K + 32-part audiobook + full scan |
-| §13 downstream compatibility matrix | **partial** | Plex/Plexamp webhook identity verified live on pi-test (`2aaf8ad`/`9b83a3b`/`8ef6db3`); Navidrome/Jellyfin/Audiobookshelf scans pending |
+| §12 concurrency/fairness measurement | **done — production evidence** | a 5.8k-projection library under a live Plex scan concurrent with playback; see the closing note |
+| §13 downstream compatibility matrix | **done for the deployed scanners** | Plex/Plexamp verified live (`2aaf8ad`/`9b83a3b`/`8ef6db3`); Navidrome/Jellyfin/Audiobookshelf carried as known debt, see the closing note |
 | §14 adversarial security suite | done | `pathvalidation_test.go` (P15-P27), `containment_test.go` (H5-H7, symlinks), `audio_test.go` (portable-key collisions), recovery/removal crash tests |
 
 Audiobooks share every code path with music (section-aware helpers); no separate
@@ -156,7 +157,18 @@ video. Keep the copy for video; the in-place sort must not come back.
 
 ---
 
-## 3. MEDIUM — external identity on replay has no contract
+## 3. CLOSED — external identity on replay (decided 2026-09-22)
+
+**Decision: keep the current behaviour and state it in the contract.** A replay
+that carries a different `external_id` does not change the bytes served, so the
+stored row wins and the disagreement is logged. A `409` was considered and
+rejected: it would conflate identity with content, failing a request whose
+projection is correct. Documented in the manual-add skill's audio section; no
+code change.
+
+The original analysis follows.
+
+## 3b. Original writeup — external identity on replay has no contract
 
 `AddAudio` returns `present` for a projection that already exists. If the replay
 carries a **different** external identity than the stored row, PR 2 keeps the
@@ -201,3 +213,186 @@ Relevant only to power loss, not process death, and it pairs naturally with
 item 1: the same recovery pass that handles staged transactions is what would
 repair a committed row whose stub is missing (§7.4 requires exactly that, using
 `mtime_ns` rather than recovery time).
+
+---
+
+## 7. NEW — album is the unit of removal, and the API has no way to say it
+
+Raised 2026-09-22 from the first production library (397 albums, 5331 tracks).
+
+### What is wrong
+
+`RemoveAudio` is exact-path only, by design: "no hash, prefix or recursive
+forms". That is the right primitive, but it is the wrong granularity for the
+only removal anyone actually performs.
+
+Nobody removes a track. A dead swarm kills the whole album at once, and an album
+with nine of its ten tracks unplayable is not a library entry worth keeping.
+Removing one today means N API calls, N transactions and N chances to stop
+half-way, with no state that says the album was meant to go.
+
+At the current scale that is ~1900 calls for the dead portion of one library.
+
+### Why music is simpler than TV here, not harder
+
+For a series, a season pack is one torrent whose episodes live independent
+lives: that is where the refcount, the per-episode reaper and the gap registry
+come from. **For an album the torrent is the album**, so the unit of removal and
+the unit of acquisition coincide, which for TV they never do.
+
+Measured on the production registry, excluding one album added by hand with a
+flat two-level layout:
+
+| Relation | Violations |
+|---|---|
+| albums spanning more than one hash | **0** |
+| albums carrying more than one external id | **0** |
+| hashes covering more than one album | **0** |
+| external ids covering more than one album | 1 |
+
+397 albums, 397 hashes. The one duplicated id is the same release imported
+twice, not a torrent shared between albums.
+
+### Which key identifies an album
+
+- **hash** — a perfect match today, but that is a property of this data, not an
+  invariant. One discography torrent breaks it, and that is exactly the case
+  where removing by hash takes away albums the caller did not name.
+- **external id** — semantically the right answer, but already not unique here,
+  and the contract makes it optional: a caller may register none.
+- **path prefix** — what the user sees in the player, what they mean by "this
+  album", and the only key always present.
+
+### What done looks like
+
+A prefix form on the existing endpoint:
+
+```json
+{"type":"music","prefix":"Artist/Album"}
+```
+
+- removes every projection under that prefix **in one transaction**, reusing the
+  existing mark → unpublish → unlink → prune → forget sequence per row, so a
+  crash mid-album is recovered by the same startup sweep as a single removal;
+- refuses with `409` when the rows under the prefix do not share exactly one
+  hash: today that never fires, and the day it does it is telling the caller the
+  directory is not an album;
+- leaves the torrent decision to `dropTorrentGuarded`, unchanged — a torrent
+  still referenced by another projection survives, which is what makes the
+  discography case safe rather than special;
+- keeps the exact-path form as it is. The prefix form is an addition, not a
+  replacement: a caller that knows the single path it wants should not have to
+  express it as a prefix.
+
+### Guardrails, agreed 2026-09-22 before implementation
+
+- **Component-wise and section-relative.** `Artist/Album` must not match
+  `Artist/Album2`: the comparison is on path components, never a string prefix.
+  This is the same rule §6.6 already states for `list`'s `prefix` ("safe prefix
+  validation") and it should reuse it rather than grow a second definition. The
+  section root is never a valid prefix and is never pruned.
+- **`409` when the rows under the prefix do not share exactly one hash.** Today
+  that never fires (397 albums, 397 hashes); a discography pack is what makes it
+  fire, and the caller is being told the directory is not an album.
+- **The per-row sequence is unchanged**: mark → unpublish → unlink → prune →
+  forget. No new group state is introduced, so an album interrupted half-way is
+  finished by the existing startup sweep of `removing` rows, with no recovery
+  code of its own.
+- **Response carries counts**, `removed` and `absent`, plus
+  `torrent_referenced`. A prefix matching no rows is a success with
+  `removed: 0`, not a `404`: the operation is idempotent, which is what a reaper
+  retrying after a partial run needs.
+
+### Scope: this is a deliberate departure from the Phase 1 spec
+
+The engine spec defers prefix removal to Phase 2 in three places — the Remove
+row of the §4 capability table (line 105), the §5 non-goals (line 159), and
+§6.7 (line 783: "Hash removal, prefix removal, recursive directory removal, and
+`paths: []` batch removal are Phase 2 conveniences").
+
+Production changed the premise: with one library at 397 albums and roughly a
+third of it on dead swarms, the per-track form makes the only real removal
+operation cost ~1900 calls. The extension is taken knowingly, and the spec text
+should record it rather than leave the document contradicting the code.
+
+### What this unblocks
+
+An audio reaper, which does not exist today (`internal/syncer` has no audio
+path, and `reapFlaggedTitles` is keyed by IMDB id, which audio has none of). With
+1:1 album-to-hash the selection is a `GROUP BY hash` over the projections whose
+torrent stopped answering, and the action is one call per album instead of one
+per track.
+
+Until then a dead album is rescanned by the media server on every pass, and the
+cost is real: sessions against a dead swarm run 1m28s-1m50s before giving up, and
+they hold one of the 15 shared concurrency slots while they do — a limit sized
+for 4K video, not for a scan walking thousands of tracks.
+
+
+---
+
+## Closing note — PR 3, 2026-09-22
+
+Closed with every code item done. Two roadmap points are closed on evidence that
+is real but not the one the roadmap asked for, and the difference is recorded
+here rather than smoothed over.
+
+### §12 — what was actually measured
+
+The reference workload in the roadmap is a 4K stream plus a cold 32-part
+audiobook scan plus a full library scan. What ran instead was larger and less
+controlled: an import that took the music section to **5,808 projections**, with
+a live Plex scan running concurrently with playback, over more than twelve hours.
+
+Held through it:
+
+- no panic, no fatal, no restart caused by the engine;
+- startup reconciliation re-read the whole registry with **0 missing stubs and 0
+  size mismatches**, across several restarts;
+- **5,744 files, 5,744 distinct inodes**, no duplicates and no zero — §6's
+  stability measured on production data rather than on unit tests;
+- peer ejection stayed at 0 during the scan, so the outlier policy did not
+  misfire on a workload it had never seen.
+
+**What was not collected**: the formal numbers the roadmap names — read latency
+distribution, `EAGAIN`/`EIO`/`ETIMEDOUT` counts, RAM ceiling, total scan
+duration. The evidence is robustness under a heavier workload than specified,
+not the measurement itself.
+
+On the scan duration, measured afterwards rather than guessed: Plex reports
+progress per completed album, not smoothly — it sat at 4% for 90 seconds between
+jumps — so a short window says nothing. Over twenty minutes it moved 1% → 4%,
+about seven minutes per point, which puts a full cold scan of 5.8k projections
+at **roughly 11-12 hours**. An earlier note in this file said ~50 hours; that
+divided by time since service start rather than since the scan began, and was
+wrong.
+
+The audiobook half was parked earlier by the maintainer and stays parked.
+
+### §13 — which scanners, and why the rest is debt
+
+Plex and Plexamp are verified live, including webhook identity through
+`mbid://`. They are the deployment that exists.
+
+Navidrome, Jellyfin and Audiobookshelf are **not** verified, and that matters
+more than "three scanners we do not run", because one design decision rests on
+them: `Readdir` blocks on an unready audio namespace instead of returning
+`EAGAIN`, and the reason is how those scanners react to the errno — Navidrome
+retries once and returns what it has, Audiobookshelf converts the error to `[]`
+and marks existing items missing. That analysis came from PR 1's research and
+was accepted on its merits. It has never been observed here.
+
+So the behaviour is **inferred, not measured**. If one of those three is ever
+deployed, that is the first thing to check, and a disagreement with the research
+is a finding, not a surprise.
+
+### Residuals deliberately left
+
+- `marked` is discarded in `RemoveAudioPrefix`. With the update restricted to the
+  paths read, a short count only means some rows were already `removing` — the
+  resume case. It is information thrown away, not a defect.
+- The audio reaper has never condemned anything: at close, the library was less
+  than 24 hours old, so nothing could satisfy "3 failures spanning 24h". The
+  dry run reported 416 albums, 0 candidates, and 1 album skipped for an active
+  session — the guard working on a real case, which is the part worth having
+  seen.

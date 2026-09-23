@@ -80,6 +80,9 @@ type Config struct {
 	// UnpublishAudioPath, when set, drops a removed projection from the namespace the
 	// VFS dispatches on, before its stub is unlinked.
 	UnpublishAudioPath func(AudioProjection)
+	// ActiveSession, when set, reports whether a hash has an open playback session.
+	// The list exposes it so a reaper can skip an album that is being listened to.
+	ActiveSession func(hash string) bool
 }
 
 // Manager adds and removes library entries on behalf of external clients: it does what
@@ -173,7 +176,10 @@ type RemoveRequest struct {
 	// and may omit it.
 	Type string `json:"type"`
 	Path string `json:"path"`
-	Hash string `json:"hash"`
+	// Prefix removes every projection under a section-relative album prefix. Path
+	// and Prefix are mutually exclusive.
+	Prefix string `json:"prefix"`
+	Hash   string `json:"hash"`
 	// Blacklist keeps the release out: without it the sync engines are free to add the
 	// title back on their next run, which is what you want when removing to upgrade
 	// and not what you want when removing for good.

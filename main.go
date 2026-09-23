@@ -223,6 +223,10 @@ var readBufferPool *sync.Pool
 // reImdbID matches "imdb://tt1234567" in the Guid array of Plex webhook payloads.
 var reImdbID = regexp.MustCompile(`"imdb://(tt\d+)"`)
 
+// webhookMaxBody bounds a webhook post. Plex sends multipart with a thumbnail, so
+// the ceiling has to clear a poster, not just the JSON.
+const webhookMaxBody = 10 * 1024 * 1024
+
 // reMbid matches "mbid://<uuid>" in Plex webhook payloads for music. A track
 // payload can carry several: the recording, its release group and the artist.
 var reMbid = regexp.MustCompile(`"mbid://([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`)
@@ -704,7 +708,7 @@ func (r *VirtualMkvRoot) Lookup(ctx context.Context, name string, out *fuse.Entr
 	if classifyVFSPath(fullPath).Stub {
 		meta, err := stubMeta(fullPath)
 		if err == nil {
-			addFileToInodeMap(fullPath, meta.URL)
+			addMetaToInodeMap(fullPath, meta)
 			ino := getFileInodeFromMap(fullPath)
 			node := &VirtualMkvNode{vMeta: meta}
 			stable := fs.StableAttr{
@@ -956,7 +960,7 @@ func (d *VirtualDirNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 	if classifyVFSPath(fullPath).Stub {
 		meta, err := stubMeta(fullPath)
 		if err == nil {
-			addFileToInodeMap(fullPath, meta.URL)
+			addMetaToInodeMap(fullPath, meta)
 			ino := getFileInodeFromMap(fullPath)
 			node := &VirtualMkvNode{vMeta: meta}
 			stable := fs.StableAttr{
@@ -1200,6 +1204,9 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	// exists, so no write path ever has to exist behind it (spec 4).
 	if n.vMeta.Audio && audioWriteIntent(flags) {
 		return nil, 0, syscall.EROFS
+	}
+	if len(n.vMeta.SegmentHeader) > 0 {
+		return n.openCueTrack(ctx, flags)
 	}
 
 	// PROACTIVE CLEANUP TRIGGER (V246): must be sync before any Read() can arrive.
@@ -2323,6 +2330,66 @@ func safeGo(fn func()) {
 // Compile-time interface checks for MkvHandle
 var _ fs.FileReader = (*MkvHandle)(nil)
 var _ fs.FileReleaser = (*MkvHandle)(nil)
+
+// cueHandle serves one cue track of a single-file image: the generated header from
+// memory, then the image's frames through an ordinary MkvHandle whose file ends
+// where the track ends. MkvHandle itself is untouched.
+type cueHandle struct {
+	inner  *MkvHandle
+	header []byte
+	base   int64 // where the track's frames start in the torrent file
+	length int64 // image bytes the track spans
+}
+
+var _ fs.FileReader = (*cueHandle)(nil)
+var _ fs.FileReleaser = (*cueHandle)(nil)
+
+// openCueTrack opens the image through the regular path, sized to end at the end of
+// the track, and wraps it.
+func (n *VirtualMkvNode) openCueTrack(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	length := n.vMeta.Size - int64(len(n.vMeta.SegmentHeader))
+	if length <= 0 {
+		return nil, 0, syscall.EIO
+	}
+	inner := *n.vMeta
+	inner.Size = n.vMeta.SegmentOffset + length
+	inner.SegmentHeader = nil
+	fh, fuseFlags, errno := (&VirtualMkvNode{vMeta: &inner, wake: n.wake}).Open(ctx, flags)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	h, ok := fh.(*MkvHandle)
+	if !ok {
+		return nil, 0, syscall.EIO
+	}
+	return &cueHandle{inner: h, header: n.vMeta.SegmentHeader, base: n.vMeta.SegmentOffset, length: length}, fuseFlags, 0
+}
+
+func (h *cueHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	hdrFrom, hdrTo, innerOff, innerN := vfs.SegmentRead(len(h.header), h.base, h.length, off, len(dest))
+	n := copy(dest, h.header[hdrFrom:hdrTo])
+	if innerN > 0 {
+		want := dest[n : n+innerN]
+		res, errno := h.inner.Read(ctx, want, innerOff)
+		if errno != 0 {
+			// Never the header alone: a short read away from EOF is EOF to the
+			// kernel, and a cold torrent would truncate the track for the player.
+			return nil, errno
+		}
+		data, _ := res.Bytes(want)
+		got := copy(dest[n:], data)
+		res.Done()
+		if got < innerN {
+			return nil, syscall.EIO
+		}
+		n += got
+	}
+	return fuse.ReadResultData(dest[:n]), 0
+}
+
+func (h *cueHandle) Release(ctx context.Context) syscall.Errno {
+	return h.inner.Release(ctx)
+}
 
 // shortAwayFromEOF reports whether a read of n bytes into a want-sized buffer at off leaves a
 // gap before end of file. Short AT eof is normal; short before it is what the kernel turns
@@ -3949,13 +4016,35 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		payloadStr = string(body)
 	} else {
-		if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
+		// A form post is a form post: the plugin may send multipart or the older
+		// application/x-www-form-urlencoded, and ParseMultipartForm reports the
+		// latter as ErrNotMultipart after ParseForm has already filled the values.
+		//
+		// The cap matters for the urlencoded branch: ParseForm reads that body with
+		// ReadAll, unbounded, and this process shares a 2200MB limit with the engine.
+		//
+		// ParseForm runs first on purpose: ParseMultipartForm swallows its error for a
+		// urlencoded body and reports ErrNotMultipart instead, so an oversized post
+		// would otherwise be read until the cap and then answer 200.
+		//
+		// The cap matches the multipart limit below rather than undercutting it: this
+		// reader wraps the body before either branch, so a smaller value here would
+		// reject a Plex webhook whose multipart carries a thumbnail, and a rejected
+		// webhook is a playback session that never gets confirmed.
+		r.Body = http.MaxBytesReader(w, r.Body, webhookMaxBody)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Bad request", 400)
+			return
+		}
+		if err := r.ParseMultipartForm(webhookMaxBody); err != nil && !errors.Is(err, http.ErrNotMultipart) {
 			http.Error(w, "Bad request", 400)
 			return
 		}
 		payloadStr = r.FormValue("payload")
 	}
 	if payloadStr == "" {
+		// Silent 200s make a misconfigured plugin a mystery: say so once per event.
+		logger.Printf("[PLEX] Webhook from %s carried no payload", r.RemoteAddr)
 		return
 	}
 
@@ -4987,6 +5076,7 @@ func main() {
 			Enabled:       gc().Scheduler.Enabled,
 			MoviesSync:    scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
 			TVSync:        scheduler.DailyJobConfig(gc().Scheduler.TVSync),
+			MusicSync:     scheduler.DailyJobConfig(gc().Scheduler.MusicSync),
 			WatchlistSync: scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
 		}
 
@@ -5033,6 +5123,16 @@ func main() {
 				DB:              stateDB,
 				AudioRegistry:   audioOwnershipRegistry(),
 				InvalidatePath:  invalidateSyncRemovedPath,
+			}),
+			"music": engines.NewMusicSyncEngine(engines.MusicSyncConfig{
+				PlexURL:      gc().Plex.URL,
+				PlexToken:    gc().Plex.Token,
+				PlexMusicLib: strconv.Itoa(gc().Plex.MusicLibraryID),
+				LibraryURL:   fmt.Sprintf("http://127.0.0.1:%d", gc().MetricsPort),
+				StateDir:     GetStateDir(),
+				LogsDir:      logsDir,
+				ProwlarrCfg:  gc().Prowlarr,
+				Discovery:    gc().MusicDiscovery,
 			}),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
@@ -5127,7 +5227,10 @@ func main() {
 			// Without this a removed projection keeps resolving until its stub is
 			// gone and the next reconciliation runs.
 			UnpublishAudioPath: unpublishAudioProjectionLive,
-			InvalidatePath:     invalidateSyncRemovedPath,
+			// The audio reaper skips albums with an open session: the swarm counter is
+			// only acquitted when that session closes.
+			ActiveSession:  ttffActiveByHash,
+			InvalidatePath: invalidateSyncRemovedPath,
 			// Read-only view of the holes the reaper left, for a client that can decide
 			// what to do about them.
 			Gaps: func() ([]library.Gap, error) {
@@ -5626,7 +5729,7 @@ func publishAudioProjectionsLive(ps []library.AudioProjection) {
 	for _, p := range ps {
 		if globalInodeMap != nil {
 			full := filepath.Join(physicalSourcePath, string(p.Section), filepath.FromSlash(p.VirtualPath))
-			globalInodeMap.AddFile(full, p.Hash, p.FileIndex)
+			globalInodeMap.AddFile(full, vfs.SegmentInodeHash(p.Hash, p.CueTrack), p.FileIndex)
 		}
 	}
 	if globalAudioNamespace != nil {
@@ -5650,6 +5753,23 @@ func addFileToInodeMap(fullPath, url string) uint64 {
 		return 0
 	}
 	return globalInodeMap.AddFile(fullPath, hash, index)
+}
+
+// addMetaToInodeMap registers a virtual file's inode. A cue track joins its track to
+// the key, since the tracks of an image share one torrent file; every other file,
+// video included, goes through addFileToInodeMap unchanged.
+func addMetaToInodeMap(fullPath string, meta *vfs.Metadata) uint64 {
+	if meta.SegmentTrack <= 0 {
+		return addFileToInodeMap(fullPath, meta.URL)
+	}
+	if globalInodeMap == nil {
+		return 0
+	}
+	hash, index := vfs.ExtractHashAndIndex(meta.URL)
+	if hash == "" {
+		return 0
+	}
+	return globalInodeMap.AddFile(fullPath, vfs.SegmentInodeHash(hash, meta.SegmentTrack), index)
 }
 
 func GetInodeMapStats() (files, dirs, hits, misses int64) {
@@ -5821,6 +5941,9 @@ func audioProjectionMeta(fullPath string, p library.AudioProjection) *vfs.Metada
 		ExternalID:          p.ExternalID,
 		ExternalIDNamespace: p.ExternalIDNamespace,
 		Audio:               true,
+		SegmentTrack:        p.CueTrack,
+		SegmentOffset:       p.ByteOffset,
+		SegmentHeader:       p.Header,
 	}
 }
 
