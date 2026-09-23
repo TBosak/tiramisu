@@ -54,6 +54,13 @@ func (b *StartupCacheBuilder) Start() {
 		b.incrementErrors()
 	}
 
+	// Reconcile audio before returning from Start. The FUSE mount becomes visible
+	// while the movie/TV cache walk below is still running; leaving audio behind
+	// that walk can exhaust the bounded readiness wait on a large video library.
+	// Reconciliation reads only the registry and stubs, so this does not hydrate
+	// or wake any torrent.
+	b.reconcileAudio()
+
 	go func() {
 		// Process movies directory
 		moviesPath := filepath.Join(b.sourcePath, "movies")
@@ -66,10 +73,6 @@ func (b *StartupCacheBuilder) Start() {
 		if _, err := os.Stat(tvPath); err == nil {
 			b.processDirectory(tvPath, true) // Recursive
 		}
-
-		// Audio is driven by the projection registry rather than by walking the
-		// section: an unknown file under music/ is not adopted just for being there.
-		b.reconcileAudio()
 
 		// Log final statistics
 		duration := time.Since(b.startTime)
