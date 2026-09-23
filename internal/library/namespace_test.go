@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -527,7 +528,7 @@ func TestAudioNamespace_PublishAndLookupPreserveCommittedIdentity(t *testing.T) 
 			if !ok {
 				t.Fatalf("Lookup(%q, %q) did not find published projection", want.Section, want.VirtualPath)
 			}
-			if got != want {
+			if !reflect.DeepEqual(got, want) {
 				t.Errorf("Lookup(%q, %q) = %#v, want every identity field intact: %#v", want.Section, want.VirtualPath, got, want)
 			}
 		})
@@ -566,7 +567,7 @@ func TestAudioNamespace_LookupPreservesBoundaryValuesAndNestedPath(t *testing.T)
 			if !ok {
 				t.Fatalf("Lookup(%q, %q) returned false", want.Section, want.VirtualPath)
 			}
-			if got != want {
+			if !reflect.DeepEqual(got, want) {
 				t.Errorf("Lookup = %#v, want exact boundary projection %#v", got, want)
 			}
 		})
@@ -643,7 +644,7 @@ func TestAudioNamespace_PublishReplacesWholeSetAndReplaceMarksReady(t *testing.T
 	if _, ok := n.Lookup(first.Section, first.VirtualPath); ok {
 		t.Error("X3 second Publish retained a projection from the first set")
 	}
-	if got, ok := n.Lookup(second.Section, second.VirtualPath); !ok || got != second {
+	if got, ok := n.Lookup(second.Section, second.VirtualPath); !ok || !reflect.DeepEqual(got, second) {
 		t.Errorf("X3 second Publish Lookup = (%#v, %v), want (%#v, true)", got, ok, second)
 	}
 	if got := n.Len(); got != 1 {
@@ -675,7 +676,7 @@ func TestAudioNamespace_AddProjectionPreservesIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("Z7 Lookup did not find projection added with AudioProjection")
 	}
-	if got != p {
+	if !reflect.DeepEqual(got, p) {
 		t.Errorf("Z7 Lookup after Add = %#v, want identity intact %#v", got, p)
 	}
 	n.Remove(p.Path())
@@ -695,7 +696,7 @@ func TestAudioNamespace_AccessorsUseNoFilesystemState(t *testing.T) {
 		t.Fatal("Y3 in-memory namespace is not ready after Publish")
 	}
 	got, ok := n.Lookup(p.Section, p.VirtualPath)
-	if !ok || got != p {
+	if !ok || !reflect.DeepEqual(got, p) {
 		t.Errorf("Y3 Lookup for nonexistent physical path = (%#v, %v), want (%#v, true)", got, ok, p)
 	}
 	if !n.HasProjection(p.Section, p.VirtualPath) {
@@ -773,13 +774,13 @@ func TestAudioNamespace_ConcurrentPublishIsAtomicWithReadinessAndIdentity(t *tes
 							return
 						}
 						got, ok := n.Lookup(target.Section, target.VirtualPath)
-						if !ok || got != target {
+						if !ok || !reflect.DeepEqual(got, target) {
 							errors <- fmt.Sprintf("Ready namespace Lookup = (%#v, %v), want (%#v, true)", got, ok, target)
 							return
 						}
 					}
 					if got, ok := n.Lookup(target.Section, target.VirtualPath); ok {
-						if got != target {
+						if !reflect.DeepEqual(got, target) {
 							errors <- fmt.Sprintf("Lookup identity = %#v, want %#v", got, target)
 							return
 						}
@@ -825,7 +826,7 @@ func TestAudioNamespace_ConcurrentPublishIsAtomicWithReadinessAndIdentity(t *tes
 						return
 					}
 					target := oldSet[(j+seed)%len(oldSet)]
-					if got, ok := n.Lookup(target.Section, target.VirtualPath); ok && got != target {
+					if got, ok := n.Lookup(target.Section, target.VirtualPath); ok && !reflect.DeepEqual(got, target) {
 						errors <- fmt.Sprintf("Lookup returned torn identity %#v, want %#v", got, target)
 						return
 					}
@@ -869,7 +870,7 @@ func TestAudioNamespace_ConcurrentPublishIsAtomicWithReadinessAndIdentity(t *tes
 					_ = n.Ready()
 					_ = n.Len()
 					_ = n.HasProjection(target.Section, target.VirtualPath)
-					if got, ok := n.Lookup(target.Section, target.VirtualPath); ok && got != target {
+					if got, ok := n.Lookup(target.Section, target.VirtualPath); ok && !reflect.DeepEqual(got, target) {
 						errors <- fmt.Sprintf("Lookup returned corrupt identity %#v, want %#v", got, target)
 						return
 					}

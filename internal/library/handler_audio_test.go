@@ -126,12 +126,12 @@ func (f *handlerAudioRegistryFake) GetAudioProjection(section, virtualPath strin
 	return &copy, true, nil
 }
 
-func (f *handlerAudioRegistryFake) AudioProjectionBySource(hash string, fileIndex int) (*metadb.AudioProjection, bool, error) {
+func (f *handlerAudioRegistryFake) AudioProjectionBySource(hash string, fileIndex, cueTrack int) (*metadb.AudioProjection, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, handlerAudioRegistryCall{method: "AudioProjectionBySource"})
 	for _, row := range f.rows {
-		if row.Hash == hash && row.FileIndex == fileIndex {
+		if row.Hash == hash && row.FileIndex == fileIndex && row.CueTrack == cueTrack {
 			copy := row
 			return &copy, true, nil
 		}
@@ -225,6 +225,37 @@ func (f *handlerAudioRegistryFake) AudioProjectionsByHash(hash string) ([]metadb
 		}
 	}
 	return rows, nil
+}
+
+func (f *handlerAudioRegistryFake) AudioProjectionsByPrefix(section, prefix string) ([]metadb.AudioProjection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, handlerAudioRegistryCall{method: "AudioProjectionsByPrefix", section: section, prefix: prefix})
+	var rows []metadb.AudioProjection
+	for _, row := range f.rows {
+		if row.Section == section && (row.VirtualPath == prefix || strings.HasPrefix(row.VirtualPath, prefix+"/")) {
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
+}
+
+func (f *handlerAudioRegistryFake) MarkAudioProjectionsRemovingPaths(section string, virtualPaths []string, updatedAtNS int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	changed := 0
+	for _, virtualPath := range virtualPaths {
+		key := handlerAudioProjectionKey(section, virtualPath)
+		row, ok := f.rows[key]
+		if !ok || row.State != metadb.AudioCommitted {
+			continue
+		}
+		row.State = metadb.AudioRemoving
+		row.UpdatedAtNS = updatedAtNS
+		f.rows[key] = row
+		changed++
+	}
+	return changed, nil
 }
 
 // recordUnpublished captures what the manager hands to the live namespace seam.
@@ -601,7 +632,7 @@ func TestHandlerInspect_W9_W10_W11_W12(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusOK, response.Body.Bytes())
 		}
-		assertJSONObjectKeys(t, response.Body.Bytes(), "files", "hash")
+		assertJSONObjectKeys(t, response.Body.Bytes(), "cue_tracks", "files", "hash")
 		var got InspectResponse
 		decodeHandlerResponse(t, response, &got)
 		if got.Hash != handlerAudioHash {
@@ -609,6 +640,9 @@ func TestHandlerInspect_W9_W10_W11_W12(t *testing.T) {
 		}
 		if got.Files == nil || len(got.Files) != 0 {
 			t.Fatalf("files = %#v, want a decoded non-nil empty array", got.Files)
+		}
+		if got.CueTracks == nil || len(got.CueTracks) != 0 {
+			t.Fatalf("cue_tracks = %#v, want a decoded non-nil empty array", got.CueTracks)
 		}
 	})
 

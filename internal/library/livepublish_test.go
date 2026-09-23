@@ -76,11 +76,11 @@ func (r *livePubRegistry) GetAudioProjection(section, path string) (*metadb.Audi
 	return &row, true, nil
 }
 
-func (r *livePubRegistry) AudioProjectionBySource(hash string, idx int) (*metadb.AudioProjection, bool, error) {
+func (r *livePubRegistry) AudioProjectionBySource(hash string, idx, cueTrack int) (*metadb.AudioProjection, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, row := range r.rows {
-		if row.Hash == hash && row.FileIndex == idx {
+		if row.Hash == hash && row.FileIndex == idx && row.CueTrack == cueTrack {
 			row := row
 			return &row, true, nil
 		}

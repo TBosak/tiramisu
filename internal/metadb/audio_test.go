@@ -615,12 +615,12 @@ func TestAudioProjectionQueries(t *testing.T) {
 		if err := db.StageAudioProjections("source", []AudioProjection{p}); err != nil {
 			t.Fatalf("stage source row: %v", err)
 		}
-		got, found, err := db.AudioProjectionBySource(p.Hash, 4)
+		got, found, err := db.AudioProjectionBySource(p.Hash, 4, 0)
 		if err != nil || !found {
 			t.Fatalf("lookup exact source = found %v, err %v", found, err)
 		}
 		requireProjectionFields(t, got, p, AudioStaged)
-		if _, found, err := db.AudioProjectionBySource(p.Hash, 5); err != nil || found {
+		if _, found, err := db.AudioProjectionBySource(p.Hash, 5, 0); err != nil || found {
 			t.Errorf("lookup different file index = found %v, err %v; want false, nil", found, err)
 		}
 	})
@@ -828,7 +828,7 @@ func TestAudioProjectionEmptyAndMissingBoundaries(t *testing.T) {
 	if _, found, err := db.GetAudioProjection("music", "missing.flac"); err != nil || found {
 		t.Errorf("F2 missing path = found %v, err %v; want false, nil", found, err)
 	}
-	if _, found, err := db.AudioProjectionBySource("missing", 1); err != nil || found {
+	if _, found, err := db.AudioProjectionBySource("missing", 1, 0); err != nil || found {
 		t.Errorf("F2 missing source = found %v, err %v; want false, nil", found, err)
 	}
 	lists := []struct {

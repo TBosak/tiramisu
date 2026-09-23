@@ -203,7 +203,7 @@ func TestValidateAudioAddRequest_Files(t *testing.T) {
 		if len(got.Files) != 1 {
 			t.Fatalf("len(Files) = %d, want 1", len(got.Files))
 		}
-		if got.Files[0] != file {
+		if !reflect.DeepEqual(got.Files[0], file) {
 			t.Errorf("Files[0] = %#v, want byte-preserved %#v", got.Files[0], file)
 		}
 	})

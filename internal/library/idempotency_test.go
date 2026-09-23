@@ -17,6 +17,7 @@ type idempotencyPathKey struct {
 type idempotencySourceKey struct {
 	hash      string
 	fileIndex int
+	cueTrack  int
 }
 
 type idempotencyPortableKey struct {
@@ -31,6 +32,7 @@ type idempotencyLookupCall struct {
 	portableKey string
 	hash        string
 	fileIndex   int
+	cueTrack    int
 }
 
 type idempotencyLookupFake struct {
@@ -65,12 +67,13 @@ func (f *idempotencyLookupFake) GetAudioProjection(section, virtualPath string) 
 	return projection, ok, nil
 }
 
-func (f *idempotencyLookupFake) AudioProjectionBySource(hash string, fileIndex int) (*metadb.AudioProjection, bool, error) {
-	key := idempotencySourceKey{hash: hash, fileIndex: fileIndex}
+func (f *idempotencyLookupFake) AudioProjectionBySource(hash string, fileIndex, cueTrack int) (*metadb.AudioProjection, bool, error) {
+	key := idempotencySourceKey{hash: hash, fileIndex: fileIndex, cueTrack: cueTrack}
 	f.calls = append(f.calls, idempotencyLookupCall{
 		method:    "AudioProjectionBySource",
 		hash:      hash,
 		fileIndex: fileIndex,
+		cueTrack:  cueTrack,
 	})
 	if err := f.sourceErrors[key]; err != nil {
 		return nil, false, err
@@ -106,6 +109,7 @@ func newIdempotencyLookupFake(projections ...*metadb.AudioProjection) *idempoten
 		fake.bySource[idempotencySourceKey{
 			hash:      projection.Hash,
 			fileIndex: projection.FileIndex,
+			cueTrack:  projection.CueTrack,
 		}] = projection
 		if projection.PortablePathKey != "" {
 			fake.byPortableKey[idempotencyPortableKey{
@@ -125,7 +129,7 @@ func TestClassifyAudioProjection_CreatedAndPresent(t *testing.T) {
 	t.Run("D1_new_path_and_unused_source_are_created", func(t *testing.T) {
 		lookup := newIdempotencyLookupFake()
 
-		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 		if err != nil {
 			t.Fatalf("ClassifyAudioProjection() error = %v, want nil", err)
 		}
@@ -152,7 +156,7 @@ func TestClassifyAudioProjection_CreatedAndPresent(t *testing.T) {
 		}
 		lookup := newIdempotencyLookupFake(existing)
 
-		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 		if err != nil {
 			t.Fatalf("ClassifyAudioProjection() error = %v, want nil", err)
 		}
@@ -217,7 +221,7 @@ func TestClassifyAudioProjection_PathIdentityConflicts_D3_D4_D5_D6_D8(t *testing
 			tt.mutate(existing)
 			lookup := newIdempotencyLookupFake(existing)
 
-			_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+			_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 			assertIdempotencyConflict(t, err, metadb.ErrAudioPathConflict)
 		})
 	}
@@ -243,6 +247,7 @@ func TestClassifyAudioProjection_SourceConflict_D7_D8(t *testing.T) {
 		hash,
 		"Artist/Album/New Destination_01234567.flac",
 		source,
+		0,
 	)
 	assertIdempotencyConflict(t, err, metadb.ErrAudioSourceConflict)
 }
@@ -262,7 +267,7 @@ func TestClassifyAudioProjection_SectionScope_D9(t *testing.T) {
 	}
 	lookup := newIdempotencyLookupFake(otherSection)
 
-	got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+	got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 	if err != nil {
 		t.Fatalf("ClassifyAudioProjection() error = %v, want nil", err)
 	}
@@ -301,7 +306,7 @@ func TestClassifyAudioProjection_RegistryErrors_D10(t *testing.T) {
 		registryErr := errors.New("registry path read failed")
 		lookup.pathErrors[idempotencyPathKey{section: string(SectionMusic), virtualPath: virtualPath}] = registryErr
 
-		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 		if !errors.Is(err, registryErr) {
 			t.Fatalf("error = %v, want errors.Is(_, %v)", err, registryErr)
 		}
@@ -334,7 +339,7 @@ func TestClassifyAudioProjection_RegistryErrors_D10(t *testing.T) {
 		registryErr := errors.New("registry source read failed")
 		lookup.sourceErrors[idempotencySourceKey{hash: hash, fileIndex: source.FileIndex}] = registryErr
 
-		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+		got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 		if !errors.Is(err, registryErr) {
 			t.Fatalf("error = %v, want errors.Is(_, %v)", err, registryErr)
 		}
@@ -376,7 +381,7 @@ func TestClassifyAudioProjection_PathConflictPrecedesSourceConflict_D11(t *testi
 	}
 	lookup := newIdempotencyLookupFake(pathOwner, sourceOwner)
 
-	_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+	_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 	assertIdempotencyConflict(t, err, metadb.ErrAudioPathConflict)
 }
 
@@ -611,7 +616,7 @@ func TestClassifyAudioProjection_NonCommittedRowsConflict_D18(t *testing.T) {
 			}
 			lookup := newIdempotencyLookupFake(existing)
 
-			got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source)
+			got, err := ClassifyAudioProjection(lookup, SectionMusic, hash, virtualPath, source, 0)
 			assertIdempotencyConflict(t, err, metadb.ErrAudioPathConflict)
 			if got.Status == AudioProjectionPresent {
 				t.Errorf("Status = %q for %q row, want conflict rather than present", got.Status, state)
@@ -657,7 +662,7 @@ func TestClassifyAudioProjection_PortableKeyConflicts_D19(t *testing.T) {
 			}
 			lookup := newIdempotencyLookupFake(existing)
 
-			_, err := ClassifyAudioProjection(lookup, SectionMusic, requestedHash, tt.requestedPath, requestedSource)
+			_, err := ClassifyAudioProjection(lookup, SectionMusic, requestedHash, tt.requestedPath, requestedSource, 0)
 			assertIdempotencyConflict(t, err, metadb.ErrAudioPathConflict)
 			wantCall := idempotencyLookupCall{
 				method:      "AudioProjectionByPortableKey",
@@ -721,7 +726,7 @@ func TestClassifyAudioProjection_PortablePathConflictPrecedesSourceConflict_D21(
 	}
 	lookup := newIdempotencyLookupFake(portableOwner, sourceOwner)
 
-	_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, requestedPath, requestedSource)
+	_, err := ClassifyAudioProjection(lookup, SectionMusic, hash, requestedPath, requestedSource, 0)
 	assertIdempotencyConflict(t, err, metadb.ErrAudioPathConflict)
 }
 

@@ -54,7 +54,7 @@ func (f *audioListRegistryFake) GetAudioProjection(string, string) (*metadb.Audi
 	panic("ListAudio must not perform point lookups")
 }
 
-func (f *audioListRegistryFake) AudioProjectionBySource(string, int) (*metadb.AudioProjection, bool, error) {
+func (f *audioListRegistryFake) AudioProjectionBySource(string, int, int) (*metadb.AudioProjection, bool, error) {
 	panic("ListAudio must not perform source lookups")
 }
 

@@ -99,11 +99,11 @@ func (r *extidRegistry) GetAudioProjection(section, path string) (*metadb.AudioP
 	return &row, true, nil
 }
 
-func (r *extidRegistry) AudioProjectionBySource(hash string, fileIndex int) (*metadb.AudioProjection, bool, error) {
+func (r *extidRegistry) AudioProjectionBySource(hash string, fileIndex, cueTrack int) (*metadb.AudioProjection, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, row := range r.committed {
-		if row.Hash == hash && row.FileIndex == fileIndex {
+		if row.Hash == hash && row.FileIndex == fileIndex && row.CueTrack == cueTrack {
 			row := row
 			return &row, true, nil
 		}

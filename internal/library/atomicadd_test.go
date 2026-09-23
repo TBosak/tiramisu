@@ -128,11 +128,11 @@ func (f *atomicRegistryFake) GetAudioProjection(section, virtualPath string) (*m
 	return &copy, true, nil
 }
 
-func (f *atomicRegistryFake) AudioProjectionBySource(hash string, fileIndex int) (*metadb.AudioProjection, bool, error) {
+func (f *atomicRegistryFake) AudioProjectionBySource(hash string, fileIndex, cueTrack int) (*metadb.AudioProjection, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, row := range f.rows {
-		if row.Hash == hash && row.FileIndex == fileIndex {
+		if row.Hash == hash && row.FileIndex == fileIndex && row.CueTrack == cueTrack {
 			copy := row
 			return &copy, true, nil
 		}
