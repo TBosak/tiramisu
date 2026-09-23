@@ -32,6 +32,11 @@ type NativeClient struct {
 	// Stateless client
 	activeHashes  sync.Map      // Map[string]bool - Fast lookup for active torrents
 	wakeSemaphore chan struct{} // V239: Limit concurrent Wake calls (max 25)
+
+	// Test seams for deterministic admission/concurrency coverage. Production
+	// clients leave both nil, preserving the real activation path.
+	beforeWakeAdmission func()
+	wakeActivation      func(context.Context, string, int) error
 }
 
 // NewNativeClient creates a new native bridge client
@@ -77,17 +82,24 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// V239-Semaphore: Guard against "Thread Exhaustion" during massive scans
+	if c.beforeWakeAdmission != nil {
+		c.beforeWakeAdmission()
+	}
+	// V239-Semaphore: Guard against thread exhaustion during massive scans.
+	// Blocking callers expect ordinary filesystem semantics, so internal
+	// admission pressure waits within the caller's context instead of becoming
+	// a terminal read error.
 	select {
 	case c.wakeSemaphore <- struct{}{}:
 		defer func() { <-c.wakeSemaphore }()
-	default:
-		// Fail-Fast: If >25 Opens are pending, we drop the request to save the filesystem.
-		// Player will retry, or fail this specific file, but FUSE remains alive.
-		return fmt.Errorf("wake semaphore exhausted (system busy)")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if c.wakeActivation != nil {
+		return c.wakeActivation(ctx, magnetUrl, fileIdx)
 	}
 	// 1. Parse Magnet/Link to get hash
 	spec, err := apiUtils.ParseLink(magnetUrl)
