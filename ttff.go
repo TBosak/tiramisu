@@ -231,10 +231,76 @@ func ttffIsReal(tailOrDeep bool, bytesRead int64) bool {
 // verdict can be exercised without a live torrent.
 var sessionActivePeers = native.ActivePeers
 
-// reportSwarmVerdict turns one finished session into a verdict. It acquits on bytes
-// that came from the swarm, and condemns a release when a whole session, however long its
-// caller chose to keep it open, ended without a single byte served and with a read
-// that gave up. The observation window is the session rather than one 8s fetch:
+// swarmVerdictCohorts groups overlapping file sessions by torrent. Audiobook
+// scanners open many parts of one release at once, and those readers share the
+// torrent and read-ahead cache. Judging each path independently turns one slow
+// but answering swarm into dozens of failures: a sibling can receive cached
+// bytes, time out later, and close before the path that fetched those bytes.
+var swarmVerdictCohorts = struct {
+	sync.Mutex
+	byHash map[string]*swarmVerdictCohort
+}{byHash: make(map[string]*swarmVerdictCohort)}
+
+type swarmVerdictCohort struct {
+	active   int
+	answered bool
+	failed   bool
+}
+
+func registerSwarmVerdictSession(hash string) {
+	if hash == "" {
+		return
+	}
+	swarmVerdictCohorts.Lock()
+	cohort := swarmVerdictCohorts.byHash[hash]
+	if cohort == nil {
+		cohort = &swarmVerdictCohort{}
+		swarmVerdictCohorts.byHash[hash] = cohort
+	}
+	cohort.active++
+	swarmVerdictCohorts.Unlock()
+}
+
+// finishSwarmVerdictSession returns a verdict only when the last overlapping
+// session closes. The boolean result is meaningful when report is true.
+func finishSwarmVerdictSession(s *TTFFSession) (resolved, report bool) {
+	answered := s.servedByNet.Load()
+	failed := false
+	if s.readFailed.Load() {
+		if opened := s.openedAt.Load(); opened != 0 &&
+			time.Since(time.Unix(0, opened)) >= sessionVerdictFloor {
+			failed = true
+		}
+	}
+
+	swarmVerdictCohorts.Lock()
+	defer swarmVerdictCohorts.Unlock()
+	cohort := swarmVerdictCohorts.byHash[s.hash]
+	if cohort == nil {
+		// Preserve the historical single-session behavior for a session created
+		// outside ttffRegister (for example, an embedding test or diagnostic).
+		return answered, answered || failed
+	}
+	cohort.answered = cohort.answered || answered
+	cohort.failed = cohort.failed || failed
+	if cohort.active > 0 {
+		cohort.active--
+	}
+	if cohort.active != 0 {
+		return false, false
+	}
+	delete(swarmVerdictCohorts.byHash, s.hash)
+	if cohort.answered {
+		return true, true
+	}
+	return false, cohort.failed
+}
+
+// reportSwarmVerdict folds one finished session into its hash's overlapping
+// cohort. The cohort acquits on bytes that came from the swarm, and condemns a
+// release once when every reader has closed, at least one eligible read gave up,
+// and none received a peer-backed byte. The observation window is the shared
+// scanner occasion rather than one 8s fetch:
 // that timeout exists to keep a FUSE read under the smbd D-state watchdog, and
 // reading a swarm's health out of it was answering a question it was never asked.
 //
@@ -242,33 +308,22 @@ var sessionActivePeers = native.ActivePeers
 // SSD warmup would clear the counter of a release the swarm never touched, which is
 // how a half-dead title stays invisible. Only srcFetchBlock counts as an answer.
 //
-// Runs before the ttffIsReal filter below on purpose: a session that served nothing
-// is exactly what that filter drops, and exactly what this needs to see.
+// Runs before the ttffIsReal filter below on purpose: sessions that served
+// nothing are exactly what that filter drops, and exactly what this needs to see.
 func (s *TTFFSession) reportSwarmVerdict() {
-	if native.ReachabilityOutcome == nil || s.hash == "" {
+	if s.hash == "" {
 		return
 	}
-	// The swarm answered at some point in this session: that clears whatever the
-	// counter had gathered, however the session ended afterwards. Without this the
-	// count only ever grows, and a release broken for a day by a tracker outage is
-	// reaped after it has already recovered.
-	if s.servedByNet.Load() {
+	resolved, report := finishSwarmVerdictSession(s)
+	if !report || native.ReachabilityOutcome == nil {
+		return
+	}
+	if resolved {
 		native.ReachabilityOutcome(s.hash, true)
 		return
 	}
-	// Deliberately not bytesRead: it counts what the player received, and the SSD
-	// warmup feeds it too. A dead release left a 38-byte warmup file behind, served it
-	// back on the next session, and suppressed its own condemnation with it. The same
-	// measure decides both directions: only the swarm answers for a release.
-	if !s.readFailed.Load() {
-		return
-	}
-	if opened := s.openedAt.Load(); opened == 0 ||
-		time.Since(time.Unix(0, opened)) < sessionVerdictFloor {
-		return
-	}
-	logger.Printf("[DeadSwarm] session of %s ended after %s with a failed read and nothing served",
-		filepath.Base(s.path), time.Since(time.Unix(0, s.openedAt.Load())).Round(time.Second))
+	logger.Printf("[DeadSwarm] overlapping sessions of %s ended with failed reads and nothing served",
+		filepath.Base(s.path))
 	native.ReachabilityOutcome(s.hash, false)
 }
 
@@ -388,6 +443,7 @@ func ttffRegister(path string, size int64, hash string, headReady, tailReady boo
 		s := actual.(*TTFFSession)
 		if s.closed.Load() {
 			sessions.Store(path, ns) // resurrect after close
+			registerSwarmVerdictSession(hash)
 			return
 		}
 		if s.firstDataAt.Load() == 0 {
@@ -397,7 +453,9 @@ func ttffRegister(path string, size int64, hash string, headReady, tailReady boo
 		s.lastReadAt.Store(nowN)
 		s.warmupHeadReady.Store(headReady)
 		s.warmupTailReady.Store(tailReady)
+		return
 	}
+	registerSwarmVerdictSession(hash)
 }
 
 // ttffRead records one served read: per-source histogram always; session state
