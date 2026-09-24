@@ -16,6 +16,8 @@ type InspectRequest struct {
 	Magnet       string `json:"magnet"`
 	Title        string `json:"title"`
 	MetadataWait int    `json:"metadata_wait"`
+	// TorrentFile is the release's .torrent (base64 in JSON), as for an add.
+	TorrentFile []byte `json:"torrent_file,omitempty"`
 }
 
 // InspectFile is one source file as the engine sees it. source_path is what a
@@ -57,8 +59,12 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	if err != nil {
 		return nil, err
 	}
+	file, err := releaseFile(req.TorrentFile, hash)
+	if err != nil {
+		return nil, err
+	}
 	if magnet == "" {
-		magnet = BuildMagnet(hash, title, DefaultTrackers())
+		magnet = BuildMagnet(hash, title, MergeTrackers(DefaultTrackers(), file.Trackers))
 	}
 
 	// Held across ownership, add and cleanup, keyed on the canonical spelling so a
@@ -74,6 +80,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	}
 	preexisting := known[lockKey]
 
+	m.uploadReleaseFile(ctx, file, title)
 	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, title)
 	if err != nil || addedHash == "" {
 		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
@@ -116,16 +123,18 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 }
 
 // inspectCueTracks lists the tracks of every FLAC a cue sheet in the torrent
-// describes. A sheet that cannot be read hides nothing but its own tracks: the image
-// stays addable as a whole file.
+// describes. Only folders shaped like an image are examined: a per-track rip keeps
+// one cue beside twelve FLACs and has no image to list. A sheet that cannot be read
+// hides nothing but its own tracks: the image stays addable as a whole file.
 func (m *Manager) inspectCueTracks(ctx context.Context, hash string, files []FileStat) []InspectCueTrack {
 	ctx, cancel := context.WithTimeout(ctx, cueSplitTimeout)
 	defer cancel()
 	out := []InspectCueTrack{}
+	dirs := imageDirs(files)
 	var sheets []*cue.Sheet
 	loaded := false
 	for _, f := range files {
-		if !strings.EqualFold(path.Ext(f.Path), ".flac") {
+		if !strings.EqualFold(path.Ext(f.Path), ".flac") || !dirs[path.Dir(f.Path)] {
 			continue
 		}
 		if !loaded {

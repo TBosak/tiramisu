@@ -108,8 +108,12 @@ func (m *Manager) AddAudio(ctx context.Context, req AddRequest) (*AudioAddRespon
 	if err != nil {
 		return nil, err
 	}
+	file, err := releaseFile(req.TorrentFile, hash)
+	if err != nil {
+		return nil, err
+	}
 	if magnet == "" {
-		magnet = BuildMagnet(hash, intent.Title, DefaultTrackers())
+		magnet = BuildMagnet(hash, intent.Title, MergeTrackers(DefaultTrackers(), file.Trackers))
 	}
 
 	// Locked on the canonical spelling so a base32 magnet and its hex form are one
@@ -123,6 +127,7 @@ func (m *Manager) AddAudio(ctx context.Context, req AddRequest) (*AudioAddRespon
 	}
 	preexisting := known[lockKey]
 
+	m.uploadReleaseFile(ctx, file, intent.Title)
 	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, intent.Title)
 	if err != nil || addedHash == "" {
 		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
@@ -182,7 +187,8 @@ func (m *Manager) AddAudio(ctx context.Context, req AddRequest) (*AudioAddRespon
 	for i, file := range intent.Files {
 		sources[i] = byPath[file.SourcePath]
 	}
-	intent.Files, sources, err = m.expandCueImages(ctx, engineHash, info.FileStats, intent.Files, sources)
+	var cueCat *cueCatalog
+	intent.Files, sources, cueCat, err = m.expandCueImages(ctx, engineHash, info.FileStats, intent.Files, sources)
 	if err != nil {
 		abandon()
 		return nil, audioErr(err)
@@ -197,7 +203,7 @@ func (m *Manager) AddAudio(ctx context.Context, req AddRequest) (*AudioAddRespon
 	}
 	// A cue track's projection is its header plus a frame range of the image, so its
 	// size is known only once the boundaries are found.
-	segments, err := m.cueSegments(ctx, engineHash, info.FileStats, intent.Files, sources)
+	segments, err := m.cueSegments(ctx, engineHash, info.FileStats, intent.Files, sources, cueCat)
 	if err != nil {
 		abandon()
 		return nil, audioErr(err)
@@ -372,6 +378,9 @@ func (m *Manager) AddAudio(ctx context.Context, req AddRequest) (*AudioAddRespon
 			})
 		}
 		m.cfg.PublishAudioPath(batch)
+	}
+	if len(rows) > 0 {
+		m.scheduleRefresh(m.audioSection(intent.Section))
 	}
 	for _, row := range rows {
 		// Published before the cache is dropped: a Readdir racing between the two
