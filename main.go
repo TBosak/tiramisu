@@ -415,6 +415,23 @@ var globalOpenTracker = opentracker.New()
 // Serializes concurrent pump creation for the same file.
 var pumpCreationMu sync.Mutex
 
+// Test seams for the two data bodies coordinated by masterDataSemaphore. The
+// defaults are the production behavior; root-package concurrency tests replace
+// them with channel-controlled bodies without a live torrent or FUSE mount.
+var demandFetchAheadFn = func(c *native.NativeClient, hash string, fileID int, off int64,
+	buf, dest []byte, onFill func(n int, done bool, err error)) (int, error) {
+	return c.FetchAhead(hash, fileID, off, buf, dest, onFill)
+}
+
+var pumpBodyFn = func(h *MkvHandle, ctx context.Context, r *native.NativeReader,
+	start int64, s *NativePumpState) {
+	h.nativePump(ctx, r, start, s)
+}
+
+var backgroundReserveHook = func(*MkvHandle) {}
+
+var demandWaitHook = func(*MkvHandle, int64) {}
+
 // NativePumpState tracks a shared pump across multiple handles for the same file.
 type NativePumpState struct {
 	cancel           context.CancelFunc
@@ -1460,32 +1477,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		}
 	}
 
-	// StrategicReserve: limit background scan slots.
-	// If any confirmed playback is active (IsHealthy), tighten the limit to 5 slots
-	// so the scan cannot consume memory that the active stream needs.
-	// Without active playback, allow up to MasterConcurrencyLimit-5 (default 20).
-	canTakeSlot := true
-	if !isHealthy {
-		anyHealthyPlayback := false
-		playbackRegistry.Range(func(_, v interface{}) bool {
-			if ps, ok := v.(*PlaybackState); ok && ps.GetStatus() {
-				anyHealthyPlayback = true
-				return false
-			}
-			return true
-		})
-		scanLimit := scanSlotLimit(cap(masterDataSemaphore), anyHealthyPlayback)
-		if len(masterDataSemaphore) >= scanLimit {
-			canTakeSlot = false
-			logger.Printf("[StrategicReserve] Denying pump slot to background scan (Saturation: %d/%d, healthyPlayback=%v): %s",
-				len(masterDataSemaphore), gc().MasterConcurrencyLimit, anyHealthyPlayback, filepath.Base(h.path))
-		}
-	}
-
-	if !canTakeSlot {
-		return
-	}
-
+	backgroundReserveHook(h)
 	pumpCreationMu.Lock()
 
 	if val, ok := activePumps.Load(h.path); ok {
@@ -1512,35 +1504,28 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		return
 	}
 
-	// Release mutex before blocking on semaphore to avoid holding it during I/O.
-	pumpCreationMu.Unlock()
+	// StrategicReserve: check and reserve while pump creation is serialized so a
+	// concurrent scan cannot race past the background limit.
+	if !isHealthy {
+		anyHealthyPlayback := false
+		playbackRegistry.Range(func(_, v interface{}) bool {
+			if ps, ok := v.(*PlaybackState); ok && ps.GetStatus() {
+				anyHealthyPlayback = true
+				return false
+			}
+			return true
+		})
+		scanLimit := scanSlotLimit(cap(masterDataSemaphore), anyHealthyPlayback)
+		if len(masterDataSemaphore) >= scanLimit {
+			pumpCreationMu.Unlock()
+			logger.Printf("[StrategicReserve] Denying pump slot to background scan (Saturation: %d/%d, healthyPlayback=%v): %s",
+				len(masterDataSemaphore), gc().MasterConcurrencyLimit, anyHealthyPlayback, filepath.Base(h.path))
+			return
+		}
+	}
 
 	select {
 	case masterDataSemaphore <- struct{}{}:
-		// Double-check activePumps after acquiring semaphore (another goroutine may have created it).
-		pumpCreationMu.Lock()
-		if val, ok := activePumps.Load(h.path); ok {
-			<-masterDataSemaphore
-			ps := val.(*NativePumpState)
-			newRefs := atomic.AddInt32(&ps.refCount, 1)
-			h.mu.Lock()
-			h.hasSlot.Store(true)
-			h.pumpState = ps
-			h.isWatching = true
-			h.nativeReader = ps.reader
-			h.pumpCancel = ps.cancel
-			h.mu.Unlock()
-			globalOpenTracker.Inc(h.hash, h.path)
-			if newRefs == 1 {
-				becomePrimary(h)
-				if curPos := atomic.LoadInt64(&ps.playerOff); curPos > 0 {
-					atomic.StoreInt64(&h.lastOff, curPos)
-				}
-			}
-			pumpCreationMu.Unlock()
-			return
-		}
-
 		h.hasSlot.Store(true)
 		becomePrimary(h) // pump creator is always primary
 		// Capture the reader now and pass it to the pump goroutine: re-reading h.nativeReader
@@ -1659,9 +1644,10 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		pumpStart := resumeOffset
 		capturedState := sharedState
 		safeGo(func() {
-			h.nativePump(pumpCtx, pumpReader, pumpStart, capturedState)
+			pumpBodyFn(h, pumpCtx, pumpReader, pumpStart, capturedState)
 		})
 	default:
+		pumpCreationMu.Unlock()
 		// If slots are full, it will fall back to per-request slots in Read
 		logger.Printf("[MasterSemaphore] Limit reached, %s will use Fallback mode", filepath.Base(h.path))
 	}
@@ -2883,7 +2869,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 
 							upgradedState := sharedState
 							safeGo(func() {
-								h.nativePump(pumpCtx, upReader, off, upgradedState)
+								pumpBodyFn(h, pumpCtx, upReader, off, upgradedState)
 							})
 						default:
 							// Reserve full, stay in burst mode for now
@@ -2896,17 +2882,28 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	}
 
 pumpSlotResolved:
-	// If still no slot (scan or reserve full), acquire a temporary slot for this read
-	if !h.hasSlot.Load() {
+	// A pump permit accounts only for the long-lived background body. Every cache
+	// miss independently admits its blocking demand fetch against the same ceiling.
+	acquired := false
+	select {
+	case masterDataSemaphore <- struct{}{}:
+		acquired = true
+	default:
+	}
+	if !acquired {
+		demandWaitHook(h, off)
 		select {
 		case masterDataSemaphore <- struct{}{}:
-			defer func() { <-masterDataSemaphore }()
+			acquired = true
 		case <-fuseCtx.Done():
 			return nil, syscall.EINTR
 		case <-time.After(30 * time.Second):
 			logger.Printf("[MasterSemaphore] Timeout waiting for slot: %s", filepath.Base(h.path))
 			return nil, syscall.ETIMEDOUT
 		}
+	}
+	if acquired {
+		defer func() { <-masterDataSemaphore }()
 	}
 
 	// Rate limiting for non-streaming (metadata) requests only; streaming bypasses to preserve playback priority.
@@ -3024,7 +3021,7 @@ pumpSlotResolved:
 			// The window keeps filling after this read returns. Re-cache on every step so the
 			// reads queued behind this one find their bytes as they land instead of waiting for
 			// the whole window; the buffer goes back to the pool only once the fill is done.
-			nFetch, err := nativeBridge.FetchAhead(h.hash, h.fileID, off, buf, dest[:target],
+			nFetch, err := demandFetchAheadFn(nativeBridge, h.hash, h.fileID, off, buf, dest[:target],
 				func(total int, done bool, _ error) {
 					if total > 0 {
 						raCache.Put(h.path, off, off+int64(total)-1, buf[:total])
