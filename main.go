@@ -432,6 +432,11 @@ var backgroundReserveHook = func(*MkvHandle) {}
 
 var demandWaitHook = func(*MkvHandle, int64) {}
 
+// lateResolutionPumpDoneHook observes completion of the asynchronous pump-start
+// decision after Read recovers a previously unresolved target. The default is a
+// no-op; tests use it only as a deterministic completion boundary.
+var lateResolutionPumpDoneHook = func(*MkvHandle) {}
+
 // NativePumpState tracks a shared pump across multiple handles for the same file.
 type NativePumpState struct {
 	cancel           context.CancelFunc
@@ -1371,11 +1376,14 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		if usesWarmup {
 			tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: n.vMeta.Size})
 		}
-		// Gillian: proactive pump start at Open() — pump ready before first Read().
-		// pumpOnce ensures single start; late rescue path in Read() handles hash=='' case.
-		h.pumpOnce.Do(func() {
-			h.startNativePump(finalHash, fileIdx)
-		})
+		// Video keeps its proactive Open-time pump. Audio has no SSD-warmup
+		// replacement in Phase 1: its cold metadata probes use demand admission,
+		// and confirmed/inferred streaming may promote later from Read.
+		if usesWarmup {
+			h.pumpOnce.Do(func() {
+				h.startNativePump(finalHash, fileIdx)
+			})
+		}
 		if usesWarmup && !headReady {
 			// Real cold start: no warmup data present yet. Signal warmupActive here, at Open(),
 			// rather than waiting for the first WriteChunk - that first-connection burst is
@@ -2480,9 +2488,16 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			h.hash = hash
 			h.fileID = fileID
 			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), h.hash[:8])
-			go h.pumpOnce.Do(func() {
-				h.startNativePump(h.hash, h.fileID)
-			})
+			if pathUsesSSDWarmup(h.path) {
+				go func() {
+					defer lateResolutionPumpDoneHook(h)
+					h.pumpOnce.Do(func() {
+						h.startNativePump(h.hash, h.fileID)
+					})
+				}()
+			} else {
+				lateResolutionPumpDoneHook(h)
+			}
 		}
 	}
 

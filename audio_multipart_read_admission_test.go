@@ -774,10 +774,11 @@ func TestAdmissionA1_ColdPathsProgressAndHealthyPathRemainsEligible(t *testing.T
 	}
 }
 
-// A1/I3: the Open call site goes through the same admission for audio, video and
-// both mixed, so nothing can bypass the reserve by starting its pump at Open.
+// A1/I3: the Open call site goes through the same admission for video (and the
+// video half of a mixed fan-out), so nothing can bypass the reserve by starting
+// its pump at Open. Cold audio Open must start zero pumps: see A4.
 func TestAdmissionA1_OpenFanOutHonoursTheBackgroundReserve(t *testing.T) {
-	for _, section := range []string{"audio", "video", "mixed"} {
+	for _, section := range []string{"video", "mixed"} {
 		for _, tc := range []struct {
 			name    string
 			healthy bool
@@ -876,9 +877,11 @@ func TestAdmissionA2_QueuedPumpOwnerRunsAfterAPermitFrees(t *testing.T) {
 // A3: 32 real concurrent readers of different files of one torrent, with the
 // background pumps admitted through Open, must all complete. Demand bodies are
 // released by channel only; the maximum is asserted while all callers are settled,
-// and progress beyond the first admitted wave is asserted separately.
+// and progress beyond the first admitted wave is asserted separately. Covers video
+// and mixed, where Open is expected to hold background pumps; the pure-audio case
+// (zero background pumps, all 32 competing directly for demand admission) is A4.
 func TestAdmissionA3_QueuedMultipartCallersAllMakeProgress(t *testing.T) {
-	for _, section := range []string{"audio", "video", "mixed"} {
+	for _, section := range []string{"video", "mixed"} {
 		for _, tc := range []struct {
 			name    string
 			healthy bool
@@ -926,6 +929,179 @@ func TestAdmissionA3_QueuedMultipartCallersAllMakeProgress(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A4: Phase 1 audio has no SSD-warmup replacement and uses demand fetch/read-ahead
+// only, so opening a native audio projection must never start a proactive
+// background pump or consume a background permit, at any fan-out size and
+// regardless of any unrelated healthy playback elsewhere.
+func TestAdmissionA4_ColdAudioOpenStartsNoBackgroundPump(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		healthy bool
+	}{
+		{name: "no healthy playback"},
+		{name: "healthy playback elsewhere"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newAdmissionRig(t, 25)
+			if tc.healthy {
+				r.markHealthy(r.audioPath("Playing"))
+			}
+			const files = 32
+			paths := make([]string, files)
+			for i := range paths {
+				paths[i] = r.audioPath(fmt.Sprintf("Track%02d", i))
+			}
+			hs := make([]*MkvHandle, files)
+			errnos := make([]syscall.Errno, files)
+			r.barrierFanOut(t, files, func(i int) { hs[i], errnos[i] = admissionOpen(r.ctx, paths[i], i+1) })
+			for i := range hs {
+				if errnos[i] != 0 || hs[i] == nil {
+					t.Fatalf("Open(%s) = errno %v", paths[i], errnos[i])
+				}
+			}
+			if granted := countSlots(hs); granted != 0 {
+				t.Errorf("%d of %d simultaneous cold audio opens started a background pump, want 0 (Phase 1 audio has no proactive warmup pump)",
+					granted, files)
+			}
+			if s := r.b.stats(); s.bgStarts != 0 {
+				t.Errorf("%d background pump bodies started for cold audio Open, want 0", s.bgStarts)
+			}
+		})
+	}
+}
+
+// A4: with zero background pumps in play, cold audio Open/Read still makes real
+// concurrent progress: every non-cancelled caller enters through ordinary demand
+// admission and completes, across admitted waves, under capacity 25.
+func TestAdmissionA4_ColdAudioReadsProgressAcrossAdmittedWaves(t *testing.T) {
+	const files = 32
+	r := newAdmissionRig(t, 25)
+	hs := make([]*MkvHandle, files)
+	for i := range hs {
+		h, errno := admissionOpen(r.ctx, r.audioPath(fmt.Sprintf("Track%02d", i)), i+1)
+		if errno != 0 {
+			t.Fatalf("Open file %d: errno %v", i, errno)
+		}
+		hs[i] = h
+	}
+	if granted := countSlots(hs); granted != 0 {
+		t.Fatalf("%d of %d cold audio opens started a background pump, want 0", granted, files)
+	}
+	if s := r.b.stats(); s.bgStarts != 0 {
+		t.Fatalf("%d background pump bodies started for cold audio Open, want 0", s.bgStarts)
+	}
+
+	cs := make([]*admissionCaller, files)
+	for i, h := range hs {
+		cs[i] = r.newCaller(h, 0)
+	}
+	r.awaitSettled(t, cs...)
+	r.requireNow(t, "32 audio callers with no background pumps in play")
+	r.awaitDemandEntered(t, 1, "first admitted wave")
+
+	r.release(files)
+	r.finish(t, cs...)
+	if s := r.b.stats(); s.demandStarts != files {
+		t.Errorf("%d demand bodies ran for %d callers, want exactly one each", s.demandStarts, files)
+	}
+	r.requireCeiling(t, "32 cold audio callers")
+	r.assertCapacityRestored(t, 0, "A4")
+}
+
+// A4/E3: an audio handle whose hash could not be resolved at Open, but resolves
+// on the first Read, must stay demand-only through the real late-resolution
+// rescue in readInner (main.go's "go h.pumpOnce.Do(startNativePump)" branch): no
+// background pump body, no background permit, and ordinary demand progress for
+// the read that triggered it. A fix that only guards the Open-time pumpOnce.Do
+// call, without also covering this rescue, would still start a proactive pump
+// here and reproduce the same scanner-capacity defect on a supported
+// activation/recovery path.
+//
+// This exercises a real, resolved audio Open, then a minimal test-only mutation
+// (clearing the already-resolved hash and resetting pumpOnce, both required so
+// the next Read takes the real branch instead of finding an already-consumed
+// Once) so the very next Read takes the real "Open() failed to resolve
+// (metadata lag), retry now" branch, exactly as a genuine recovery would.
+//
+// The rescue dispatches its pump-start attempt with `go`, decoupled from this
+// Read's own return, so there is no event on the caller's own path whose absence
+// can be awaited directly. lateResolutionPumpDoneHook is the lead's declaration
+// seam for exactly this: it is deferred inside that goroutine, immediately after
+// its pumpOnce.Do(startNativePump) call returns, and fires whether or not a pump
+// was started. Waiting for it (a channel receive, with only the suite's usual
+// deadlock failsafe bounding it) is a true completion boundary for the async
+// decision, not a wall-clock guess: it cannot fire before the decision is made,
+// and a slow host only delays the receive, never invalidates it.
+func TestAdmissionA4_LateResolvedAudioReadStaysDemandOnly(t *testing.T) {
+	r := newAdmissionRig(t, 25)
+	path := r.audioPath("LateResolved")
+	h, errno := admissionOpen(r.ctx, path, 1)
+	if errno != 0 {
+		t.Fatalf("audio Open errno = %v", errno)
+	}
+	if h.hash == "" {
+		t.Fatal("test setup: audio Open resolved no hash to force-clear")
+	}
+	beforeRescue := r.b.stats().bgStarts
+	if granted := countSlots([]*MkvHandle{h}); granted != 0 {
+		t.Errorf("test setup: the resolved audio Open already holds a background pump (see A4); this test isolates the late-resolution rescue on top of that")
+	}
+
+	prevDone := lateResolutionPumpDoneHook
+	rescueDone := make(chan *MkvHandle, 1)
+	lateResolutionPumpDoneHook = func(hh *MkvHandle) {
+		select {
+		case rescueDone <- hh:
+		default:
+		}
+	}
+	t.Cleanup(func() { lateResolutionPumpDoneHook = prevDone })
+
+	// Test-only mutation: forces the real late-resolution branch to run on the
+	// next Read. h.url, h.path and h.size are left exactly as the real Open
+	// produced them.
+	h.mu.Lock()
+	h.hash = ""
+	h.pumpOnce = sync.Once{}
+	h.mu.Unlock()
+
+	c := r.newCaller(h, 0)
+	r.awaitEntered(t, c.file, "late-resolved audio demand read")
+	r.release(1)
+	r.requireData(t, c, "late-resolved audio read")
+
+	select {
+	case got := <-rescueDone:
+		if got != h {
+			t.Fatalf("lateResolutionPumpDoneHook fired for a different handle than the one under test")
+		}
+	case <-time.After(admissionFailSafe):
+		t.Fatal("the late-resolution pump-start decision never completed (lateResolutionPumpDoneHook never fired)")
+	}
+
+	// held is the authoritative signal for cleanup: it reflects whichever call
+	// site (Open or this rescue) actually holds the permit, so the release below
+	// is correct even if Open's own pumpOnce already claimed the slot and this
+	// rescue's startNativePump returned immediately without a fresh bgStarts.
+	held := h.hasSlot.Load()
+	if held {
+		t.Error("the late-resolution rescue left the audio handle holding a background pump slot, want none")
+	}
+	if after := r.b.stats().bgStarts; after != beforeRescue {
+		t.Errorf("the late-resolution rescue started %d background pump body(s) for an audio read, want 0", after-beforeRescue)
+	}
+
+	// Preserve the RED signal above, then deterministically drain the observed
+	// pump (channel-released, not timed) before capacity-restoration callers are
+	// launched: assertCapacityRestored expects every permit free, and a still-held
+	// slot would otherwise fatal it on a starved fresh caller and leak that
+	// caller's goroutine past this test's cleanup.
+	if held {
+		r.releaseAllPumps(t, 1)
+	}
+	r.assertCapacityRestored(t, 0, "A4late")
 }
 
 // I1: a queued caller that is cancelled returns the interrupted result, never
@@ -1105,6 +1281,103 @@ func TestAdmissionI3_VideoKeepsProactivePumpAndDemandReads(t *testing.T) {
 	r.requireCeiling(t, "video and audio")
 	r.releaseAllPumps(t, 1)
 	r.assertCapacityRestored(t, 0, "I3")
+}
+
+// I4: removing the audio Open-time pump must not remove pumping from the product.
+// A later audio read that satisfies the existing confirmed/inferred streaming
+// policy remains eligible to promote to one shared background pump, exactly as it
+// did before, and the promoting read's own cache-miss demand fetch is still
+// independently admitted against the same ceiling.
+func TestAdmissionI4_ConfirmedAudioReadPromotesToOneSharedPump(t *testing.T) {
+	const capacity = 3
+	r := newAdmissionRig(t, capacity)
+	path := r.audioPath("Streaming")
+	r.markHealthy(path)
+	h := r.handle(path, r.file())
+
+	c := r.newCaller(h, 0)
+	r.awaitPumps(t, 1)
+	if !h.hasSlot.Load() {
+		t.Fatal("a confirmed-playback audio read did not promote to a background pump")
+	}
+	v, ok := activePumps.Load(path)
+	if !ok {
+		t.Fatal("no active pump was registered for the promoted audio path")
+	}
+	h.mu.Lock()
+	shared := h.pumpState == v.(*NativePumpState)
+	h.mu.Unlock()
+	if !shared {
+		t.Error("the promoting handle is not attached to the pump state it registered")
+	}
+
+	r.awaitEntered(t, h.fileID, "the promoting read's own demand fetch")
+	r.requireNow(t, "one promoted pump plus its own demand read")
+	r.release(1)
+	r.requireData(t, c, "promoted audio read")
+	r.requireCeiling(t, "confirmed audio promotion")
+
+	r.releaseAllPumps(t, 1)
+	r.assertCapacityRestored(t, 0, "I4")
+}
+
+// I4: video Open must still start its proactive pump, and a mixed audio/video
+// fan-out must charge background permits only for the video paths that actually
+// pump; no audio path in the mix may ever hold one.
+func TestAdmissionI4_MixedFanOutChargesBackgroundPermitsOnlyForVideo(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		healthy bool
+		limit   int
+	}{
+		{name: "no healthy playback", limit: 20},
+		{name: "healthy playback", healthy: true, limit: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newAdmissionRig(t, 25)
+			if tc.healthy {
+				r.markHealthy(r.audioPath("Playing"))
+			}
+			const files = 32
+			paths := make([]string, files)
+			isVideo := make([]bool, files)
+			for i := range paths {
+				paths[i] = r.sectionPath("mixed", i)
+				isVideo[i] = i%2 == 1
+			}
+			hs := make([]*MkvHandle, files)
+			errnos := make([]syscall.Errno, files)
+			r.barrierFanOut(t, files, func(i int) { hs[i], errnos[i] = admissionOpen(r.ctx, paths[i], i+1) })
+			for i := range hs {
+				if errnos[i] != 0 || hs[i] == nil {
+					t.Fatalf("Open(%s) = errno %v", paths[i], errnos[i])
+				}
+			}
+			granted, videoGranted := 0, 0
+			for i, h := range hs {
+				if !h.hasSlot.Load() {
+					continue
+				}
+				granted++
+				if isVideo[i] {
+					videoGranted++
+				} else {
+					t.Errorf("audio path %s holds a background pump permit in a mixed fan-out", paths[i])
+				}
+			}
+			if granted != videoGranted {
+				t.Errorf("%d background permits granted but only %d were video paths, want an audio path to never hold one", granted, videoGranted)
+			}
+			if videoGranted < 1 {
+				t.Error("no video path received a background pump in the mixed fan-out")
+			}
+			if videoGranted > tc.limit {
+				t.Errorf("%d video pumps granted, want at most %d", videoGranted, tc.limit)
+			}
+			r.awaitPumps(t, granted)
+			r.releaseAllPumps(t, granted)
+		})
+	}
 }
 
 // E1 (bounds): at and below the five-slot reserve the background limit is a
