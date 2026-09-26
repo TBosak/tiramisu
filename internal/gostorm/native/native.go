@@ -33,17 +33,79 @@ type NativeClient struct {
 	// Stateless client
 	activeHashes  sync.Map      // Map[string]bool - Fast lookup for active torrents
 	wakeSemaphore chan struct{} // V239: Limit concurrent Wake calls (max 25)
+	wakeLanesMu   sync.Mutex
+	wakeLanes     map[string]*wakeLane
 
 	// Test seams for deterministic admission/concurrency coverage. Production
-	// clients leave both nil, preserving the real activation path.
+	// clients leave them nil, preserving the real activation path.
 	beforeWakeAdmission func()
 	wakeActivation      func(context.Context, string, int) error
+	// sameHashWaitHook observes a caller that is about to block behind another
+	// Wake for the same canonical info hash.
+	sameHashWaitHook func(string)
+}
+
+type wakeLane struct {
+	permit chan struct{}
+	refs   int
+}
+
+// enterSameHashWake serializes activation of one canonical info hash without
+// spending a global Wake permit while queued. The reference count keeps the
+// lane stable until its holder and every waiter have either run or cancelled.
+func (c *NativeClient) enterSameHashWake(ctx context.Context, hash string) (func(), error) {
+	c.wakeLanesMu.Lock()
+	lane := c.wakeLanes[hash]
+	if lane == nil {
+		lane = &wakeLane{permit: make(chan struct{}, 1)}
+		c.wakeLanes[hash] = lane
+	}
+	lane.refs++
+	c.wakeLanesMu.Unlock()
+
+	dropRef := func() {
+		c.wakeLanesMu.Lock()
+		lane.refs--
+		if lane.refs == 0 && c.wakeLanes[hash] == lane {
+			delete(c.wakeLanes, hash)
+		}
+		c.wakeLanesMu.Unlock()
+	}
+
+	select {
+	case lane.permit <- struct{}{}:
+	default:
+		if c.sameHashWaitHook != nil {
+			c.sameHashWaitHook(hash)
+		}
+		select {
+		case lane.permit <- struct{}{}:
+		case <-ctx.Done():
+			dropRef()
+			return nil, ctx.Err()
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		<-lane.permit
+		dropRef()
+		return nil, err
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-lane.permit
+			dropRef()
+		})
+	}, nil
 }
 
 // NewNativeClient creates a new native bridge client
 func NewNativeClient() *NativeClient {
 	return &NativeClient{
 		wakeSemaphore: make(chan struct{}, 25), // Max 25 concurrent Wake operations
+		wakeLanes:     make(map[string]*wakeLane),
 	}
 }
 
@@ -83,6 +145,25 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Parse before admission so callers for one multipart torrent can wait on
+	// their hash lane without consuming all global activation permits. Existing
+	// injected admission tests deliberately use an invalid link; keep that seam
+	// path while production still returns the wrapped parse error.
+	spec, parseErr := apiUtils.ParseLink(magnetUrl)
+	var hash string
+	if parseErr == nil {
+		hash = spec.InfoHash.HexString()
+		releaseHash, err := c.enterSameHashWake(ctx, hash)
+		if err != nil {
+			return err
+		}
+		defer releaseHash()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.beforeWakeAdmission != nil {
 		c.beforeWakeAdmission()
 	}
@@ -99,15 +180,15 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if parseErr != nil {
+		if c.wakeActivation != nil {
+			return c.wakeActivation(ctx, magnetUrl, fileIdx)
+		}
+		return fmt.Errorf("parse link error: %w", parseErr)
+	}
 	if c.wakeActivation != nil {
 		return c.wakeActivation(ctx, magnetUrl, fileIdx)
 	}
-	// 1. Parse Magnet/Link to get hash
-	spec, err := apiUtils.ParseLink(magnetUrl)
-	if err != nil {
-		return fmt.Errorf("parse link error: %w", err)
-	}
-	hash := spec.InfoHash.HexString()
 
 	// 2. Dedup: Check if already active (optimization)
 	var t *torr.Torrent
