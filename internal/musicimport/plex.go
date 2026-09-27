@@ -24,6 +24,9 @@ type Album struct {
 	// ReleaseID is the MusicBrainz release id Plex stored for the album, empty
 	// when the album was never matched.
 	ReleaseID string
+	// ReleaseGroupID is the release group when the server stores it (Jellyfin does,
+	// Plex does not): the dedup then needs no MusicBrainz resolution.
+	ReleaseGroupID string
 }
 
 // Artist is one artist as Plex describes it. MBID is empty when the agent never
@@ -174,11 +177,15 @@ func (p *PlexClient) Artists(ctx context.Context, section string) ([]Artist, err
 	return artists, nil
 }
 
-// History lists the music plays that started after the given time; a zero time means
-// all of them. The seed pass reads this once per window.
+// plexOwnerAccount is the server owner's account id: the seeds follow the owner's
+// taste, not the plays of the users the server is shared with.
+const plexOwnerAccount = "1"
+
+// History lists the owner's music plays that started after the given time; a zero
+// time means all of them. The seed pass reads this once per window.
 func (p *PlexClient) History(ctx context.Context, after time.Time) ([]Play, error) {
 	var container plexHistoryContainer
-	query := url.Values{"sort": {"viewedAt:desc"}}
+	query := url.Values{"sort": {"viewedAt:desc"}, "accountID": {plexOwnerAccount}}
 	if !after.IsZero() {
 		query.Set("viewedAt>", strconv.FormatInt(after.Unix(), 10))
 	}

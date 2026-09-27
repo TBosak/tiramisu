@@ -420,6 +420,7 @@ subprocess to babysit.
 | **Movies** | Scheduler / manual | TMDB Discover + Popular → Prowlarr/Torrentio → GoStorm → virtual `.mkv` |
 | **TV Series** | Scheduler / manual | TV series with fullpack-first approach, episode registry |
 | **Watchlist** | Scheduler / manual | Plex cloud watchlist → IMDB → Prowlarr/Torrentio → GoStorm |
+| **Music** | Scheduler / manual | New albums of your artists + new artists close to yours + niche artists of your genres + similar artists (Deezer) → MusicBrainz → Prowlarr → FLAC projections |
 
 **Quality ladder**: `4K DV > 4K HDR10+ > 4K HDR > 4K > 1080p REMUX > 1080p`\
 **Minimum seeders**: 15, for the main sync and the watchlist alike (the watchlist uses the movie profile)
@@ -923,7 +924,7 @@ nano /home/pi/Tiramisu/config.json
 | `gostorm_url` | `http://127.0.0.1:8090` | GoStorm internal API URL |
 | `proxy_listen_port` | `8080` | Legacy field kept for config compatibility: no listener uses it today |
 | `metrics_port` | `9080` | Metrics, Control Panel, Webhook port |
-| `media_server_type` | `plex` | `plex` or `jellyfin`; selects how the post-sync library refresh is issued |
+| `media_server_type` | `plex` | `plex` or `jellyfin`; selects how the post-sync library refresh is issued and which API the music sync reads |
 | `torrentio_url` | `https://torrentio.strem.fun` | Torrentio base URL, the fallback when Prowlarr is disabled or finds nothing |
 | `blocklist_enabled` | `false` | Load the peer IP blocklist (not needed behind a VPN) |
 | `blocklist_url` | *(iblocklist Level 1)* | Gzipped blocklist URL, refreshed every 24 h; compression is detected from the content |
@@ -932,6 +933,22 @@ nano /home/pi/Tiramisu/config.json
 | `plex.token` | *(none)* | Plex token, or Jellyfin API key |
 | `plex.library_id` | `0` | Plex movies library section ID (0 = skip the refresh) |
 | `plex.tv_library_id` | `0` | Plex TV series library section ID (0 = skip the refresh) |
+| `plex.music_library_id` | `0` | Plex music library section Tiramisu files into: rescanned after an audio add or removal, and the only library the music sync follows new albums from (0 = both off). Jellyfin setups leave it at 0 |
+| `scheduler.music_sync` | Sunday 15:00 | Weekly music sync slot (`config.json` only: the Sync Scheduler card has no music row) |
+| `music_discovery.new_releases.enabled` | `true` | Follow the new albums of the artists in Tiramisu's music library |
+| `music_discovery.new_releases.window_days` | `30` | How recent an album's first edition must be to count as new |
+| `music_discovery.new_artists.enabled` | `true` | Import recent albums of new artists whose nearest artists you own |
+| `music_discovery.new_artists.window_days` | `30` | How far back the fresh-releases feed is read (at most 90) |
+| `music_discovery.new_artists.debut_years` | `3` | An artist counts as new when its first album or EP is at most this old (0 = any age) |
+| `music_discovery.max_albums_per_run` | `20` | Cap shared by the new-artist, genre and similar-artist passes (new albums of your own artists are uncapped) |
+| `music_discovery.seeds_recency_days` | `[1, 7, 30, 60]` | Age tiers of the plays that pick your seed artists: a play weighs 1 in the first tier and half as much in each next one; older plays do not count, and with no plays in the last tier the genre and similar-artist passes find nothing |
+| `music_discovery.seeds_min_plays` | `3` | Plays an artist needs inside the tiers to become a seed |
+| `music_discovery.genres.enabled` | `true` | Import niche artists of the genres you listen to now, close to your artists |
+| `music_discovery.genres.count` | `8` | How many of your genres are explored |
+| `music_discovery.genres.debut_years` | `15` | An artist of the genre pass counts as new when its first album or EP is at most this old (0 = any age) |
+| `music_discovery.similar.min_fans` | `10000` | Similar artists with fewer Deezer fans are too obscure to suggest (0 = no floor) |
+| `music_discovery.similar.max_fans` | `100000` | Similar artists with more Deezer fans are too known to suggest (0 = no limit) |
+| `music_discovery.similar.debut_years` | `15` | A similar artist's first album or EP must be at most this old (0 = any age) |
 | `tmdb_api_key` | *(none)* | TMDB API key |
 | `prowlarr.enabled` | `false` | Use Prowlarr as primary indexer (falls back to Torrentio if disabled) |
 | `prowlarr.api_key` | *(none)* | Prowlarr API key (Settings → General → API Key) |
@@ -1091,6 +1108,59 @@ curl -X POST http://127.0.0.1:9080/api/scheduler/watchlist/run
 
 Reads Plex cloud watchlist → IMDB ID resolution → Prowlarr/Torrentio (min 15 seeders, the movie profile) → GoStorm.
 
+### Music Sync
+
+```bash
+curl -X POST http://127.0.0.1:9080/api/scheduler/music/run
+```
+
+Weekly, Sunday 15:00 by default (`scheduler.music_sync`). Every album is filed
+through the Library API as FLAC projections, one per track. Three passes:
+
+- **New albums of your artists.** Every artist of Tiramisu's music library with a
+  MusicBrainz id is followed: albums and EPs whose first edition came out in the
+  last `window_days` (30) and that the library lacks are imported, with no cap.
+  Live, compilation and remix groups, reissues, undated and future releases never
+  qualify. An album with no torrent yet is retried on every run while it stays in
+  the window. MusicBrainz is asked in batches of 40 artists, so 800 artists cost
+  about 20 requests.
+- **New artists close to yours.** The sitewide ListenBrainz fresh-releases feed is
+  filtered down to artists you do not have whose nearest artists on ListenBrainz
+  include yours, and whose first album or EP is at most `debut_years` (3) old;
+  more of your artists among the neighbours ranks higher. Only about a third of new
+  artists have similarity data yet, so expect a handful a month. The first run
+  looks up every artist of the window (about an hour for 30 days); the answers are
+  cached in the discovery state for 30 days, so later runs look up only the week's
+  new names.
+- **Niche artists of your genres (Plex only).** The genres of your seed artists
+  (below) pick the pools: the least played recordings of each genre on ListenBrainz,
+  resolved to artists you do not have. An artist is kept when one of your artists is
+  among its nearest neighbours and its first album or EP is at most `debut_years`
+  (15) old; one of your seeds among the neighbours ranks it highest. Its latest
+  studio album already released is imported.
+- **Similar artists (Plex only).** The Deezer related artists of your seed artists
+  (public endpoints, no key), pooled and ranked by how many of your seeds point at
+  them. Artists any library already holds, artists outside `min_fans`-`max_fans`
+  (10,000-100,000) Deezer fans and artists whose first album or EP is older than
+  `debut_years` (15) are dropped; the latest studio album comes from MusicBrainz.
+
+The seeds come from the Plex server owner's plays of the last 60 days (the users the
+server is shared with do not count), weighted by age: a play of
+the last day counts 1, of the last week 0.5, of the last month 0.25, of the last two
+months 0.125. With no plays in 60 days the genre and similar-artist passes find
+nothing.
+
+The last three passes share `max_albums_per_run` (20), in order new artists, genres,
+similar artists, one album per artist.
+
+The new-album pass reads only Tiramisu's own music library, for the artists and
+for the duplicate check: on Plex the section in `plex.music_library_id` (0 turns
+the pass off), on Jellyfin the music library that holds the albums Tiramisu filed.
+Jellyfin keeps no play history, so there the genre and similar-artist passes are
+skipped and the other two run. It reads `/Library/VirtualFolders` and `/Items` with the `Authorization: MediaBrowser`
+header, which Jellyfin 10.x and 12.x both accept, and needs MusicBrainz ids on the
+albums (tagged files, or the bundled MusicBrainz metadata provider).
+
 ---
 
 ## Library API (`:9080`)
@@ -1210,6 +1280,14 @@ Projections are read-only to their clients: files answer `0444`, directories
 `0555`, and the mutations a scanner never needs (write open, truncate, rename,
 mkdir, chmod) are refused with `EROFS`, while a direct unlink gets `EPERM`. Adding,
 re-filing and removing happen only through the API.
+
+Two things worth knowing before scripting against it. The `type` must be exactly
+`music` or `audiobook`: `list` keeps the legacy fallback for unknown values, so the
+plural `audiobooks` answers `200` with the movie library instead of an error. And a
+music add or removal asks the media server to rescan the section in
+`plex.music_library_id` (Jellyfin refreshes every library, audiobooks included).
+On Plex, audiobooks have no library id yet, so the `audiobooks/` section is scanned
+manually, once, when the batch is done.
 
 ### Episode gaps (v1.9.71)
 
