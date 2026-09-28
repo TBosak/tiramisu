@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"strings"
 
 	"tiramisu/internal/audiobookimport"
+	"tiramisu/internal/audiobookjob"
+	serviceconfig "tiramisu/internal/config"
 )
 
 type Config struct {
@@ -58,6 +61,35 @@ func ParseConfig(args []string) (Config, error) {
 
 type Dependencies struct {
 	Build func(context.Context, Config) (audiobookimport.RunnerDeps, error)
+}
+
+// LiveDependencies is the standalone command's declaration-only bridge to
+// the native audiobook dependency factory. The behavioral implementation is
+// supplied with the scheduler wiring slice.
+func LiveDependencies(cli Config) (Dependencies, error) {
+	data, err := os.ReadFile(cli.ConfigPath)
+	if err != nil {
+		return Dependencies{}, errors.New("unable to read service configuration")
+	}
+	var svc serviceconfig.Config
+	if err := json.Unmarshal(data, &svc); err != nil {
+		return Dependencies{}, errors.New("unable to parse service configuration")
+	}
+	build := func(ctx context.Context, current Config) (audiobookimport.RunnerDeps, error) {
+		limits := svc.Audiobooks.Limits
+		limits.MaxCandidates = current.MaxCandidates
+		limits.MaxImports = current.MaxImports
+		cfg := audiobookjob.Config{
+			AudioSiloURL: svc.Audiobooks.AudioSiloURL, AudioSiloToken: svc.Audiobooks.AudioSiloToken,
+			AudiobookshelfURL: svc.Audiobooks.AudiobookshelfURL, AudiobookshelfToken: svc.Audiobooks.AudiobookshelfToken,
+			AudiobookshelfLibraryID: current.LibraryID, LibraryURL: fmt.Sprintf("http://127.0.0.1:%d", svc.MetricsPort),
+			StatePath: current.StatePath, RemovalPolicy: svc.Audiobooks.RemovalPolicy,
+			ProwlarrCfg: svc.Prowlarr, Categories: svc.Audiobooks.Categories, IndexerIDs: svc.Audiobooks.IndexerIDs,
+			Limits: limits, PaceSeconds: svc.Audiobooks.PaceSeconds,
+		}
+		return audiobookjob.BuildLiveDeps(ctx, cfg)
+	}
+	return Dependencies{Build: build}, nil
 }
 
 func RunCLI(ctx context.Context, cfg Config, deps Dependencies, stdout, stderr io.Writer) int {
@@ -119,10 +151,12 @@ func main() {
 		writeSafe(os.Stderr, err.Error())
 		os.Exit(2)
 	}
-	// Live dependency construction is installed by the application wiring
-	// layer; keeping the command runner injectable makes the orchestration
-	// usable by the scheduler and deterministic in tests.
-	code := RunCLI(context.Background(), cfg, Dependencies{}, os.Stdout, os.Stderr)
+	deps, err := LiveDependencies(cfg)
+	if err != nil {
+		writeSafe(os.Stderr, "unable to construct audiobook import dependencies")
+		os.Exit(1)
+	}
+	code := RunCLI(context.Background(), cfg, deps, os.Stdout, os.Stderr)
 	if code != 0 {
 		os.Exit(code)
 	}

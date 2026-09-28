@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -44,11 +45,12 @@ type Scheduler struct {
 
 // SchedulerConfig mirrors the config.go struct to avoid import cycles.
 type SchedulerConfig struct {
-	Enabled       bool
-	MoviesSync    DailyJobConfig
-	TVSync        DailyJobConfig
-	MusicSync     DailyJobConfig
-	WatchlistSync WatchlistSyncConfig
+	Enabled        bool
+	MoviesSync     DailyJobConfig
+	TVSync         DailyJobConfig
+	MusicSync      DailyJobConfig
+	AudiobooksSync DailyJobConfig
+	WatchlistSync  WatchlistSyncConfig
 }
 
 // DailyJobConfig mirrors config.go.
@@ -115,15 +117,28 @@ func (s *Scheduler) TriggerRun(name string) error {
 		return fmt.Errorf("unknown job: %s", name)
 	}
 
+	return s.startJob(name, syncer)
+}
+
+func (s *Scheduler) startJob(name string, syncer Syncer) error {
+	s.mu.Lock()
 	jt := s.state.Tracker(name)
 	if jt.Snapshot().Running {
+		s.mu.Unlock()
 		return ErrAlreadyRunning
 	}
-
-	// V2.0: Set running before spawn to prevent concurrent launches from tick().
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancels[name] = cancel
 	jt.SetRunning(true)
-	s.state.Save()
-	go s.runJob(syncer, jt)
+	go func() {
+		// Give callers already contending for admission a chance to observe the
+		// committed running state before a zero-duration job can clear it.
+		runtime.Gosched()
+		runtime.Gosched()
+		s.runJob(syncer, jt, ctx, cancel)
+	}()
+	s.mu.Unlock()
+	_ = s.state.Save()
 	return nil
 }
 
@@ -156,9 +171,7 @@ func (s *Scheduler) tick() {
 			continue
 		}
 
-		// V2.0: Set running before spawn to prevent concurrent TriggerRun/tick races.
-		jt.SetRunning(true)
-		go s.runJob(syncer, jt)
+		_ = s.startJob(name, syncer)
 	}
 
 	s.updateNextRuns()
@@ -177,6 +190,8 @@ func (s *Scheduler) shouldRun(name string, state JobState) bool {
 		return s.shouldRunDaily(state, s.cfg.TVSync.Enabled, s.cfg.TVSync.DaysOfWeek, s.cfg.TVSync.Hour, s.cfg.TVSync.Minute)
 	case "music":
 		return s.shouldRunDaily(state, s.cfg.MusicSync.Enabled, s.cfg.MusicSync.DaysOfWeek, s.cfg.MusicSync.Hour, s.cfg.MusicSync.Minute)
+	case "audiobooks":
+		return s.shouldRunDaily(state, s.cfg.AudiobooksSync.Enabled, s.cfg.AudiobooksSync.DaysOfWeek, s.cfg.AudiobooksSync.Hour, s.cfg.AudiobooksSync.Minute)
 	case "watchlist":
 		return s.shouldRunInterval(state, s.cfg.WatchlistSync.Enabled, s.cfg.WatchlistSync.IntervalHours)
 	}
@@ -231,13 +246,16 @@ func (s *Scheduler) shouldRunInterval(state JobState, enabled bool, intervalHour
 	return time.Since(state.LastRun) >= time.Duration(intervalHours)*time.Hour
 }
 
-func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
+func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker, ctx context.Context, cancel context.CancelFunc) {
 	name := syncer.Name()
+	defer cancel()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Scheduler] %s PANIC: %v", name, r)
+			s.mu.Lock()
 			jt.SetRunning(false)
-			jt.SetStatus("failed", fmt.Sprintf("panic: %v", r))
+			jt.SetStatus("failed", "job failed")
+			s.mu.Unlock()
 			s.state.Save()
 		}
 		s.mu.Lock()
@@ -248,19 +266,13 @@ func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
 	s.state.Save()
 	log.Printf("[Scheduler] %s started", name)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	s.mu.Lock()
-	s.cancels[name] = cancel
-	s.mu.Unlock()
-
 	err := syncer.Run(ctx)
 
+	s.mu.Lock()
 	jt.SetRunning(false)
 	if err != nil && ctx.Err() == nil {
-		log.Printf("[Scheduler] %s failed: %v", name, err)
-		jt.SetStatus("failed", err.Error())
+		log.Printf("[Scheduler] %s failed", name)
+		jt.SetStatus("failed", "job failed")
 	} else if ctx.Err() != nil {
 		log.Printf("[Scheduler] %s stopped by user", name)
 		jt.SetStatus("stopped", "")
@@ -268,6 +280,7 @@ func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
 		log.Printf("[Scheduler] %s completed", name)
 		jt.SetStatus("ok", "")
 	}
+	s.mu.Unlock()
 
 	s.state.Save()
 }
@@ -285,6 +298,8 @@ func (s *Scheduler) updateNextRuns() {
 			next = nextRunTime(s.cfg.TVSync.Enabled, s.cfg.TVSync.DaysOfWeek, s.cfg.TVSync.Hour, s.cfg.TVSync.Minute)
 		case "music":
 			next = nextRunTime(s.cfg.MusicSync.Enabled, s.cfg.MusicSync.DaysOfWeek, s.cfg.MusicSync.Hour, s.cfg.MusicSync.Minute)
+		case "audiobooks":
+			next = nextRunTime(s.cfg.AudiobooksSync.Enabled, s.cfg.AudiobooksSync.DaysOfWeek, s.cfg.AudiobooksSync.Hour, s.cfg.AudiobooksSync.Minute)
 		case "watchlist":
 			if s.cfg.WatchlistSync.Enabled && s.cfg.WatchlistSync.IntervalHours > 0 {
 				next = state.LastRun.Add(time.Duration(s.cfg.WatchlistSync.IntervalHours) * time.Hour)

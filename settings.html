@@ -1629,6 +1629,16 @@
                         </div>
 
                         <!-- Plex Watchlist Sync -->
+						<div class="form-section">
+							<div class="form-section-title">Audiobooks Discovery and Import</div>
+							<div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+								<div class="form-group" style="flex:1;min-width:0;"><label>Weekdays</label><div class="day-picker" id="sched-audiobooks-days"></div></div>
+								<div class="form-group" style="flex-shrink:0;"><label>Start time</label><input type="time" id="sched-audiobooks-time"></div>
+							</div>
+							<div class="sched-meta" id="sched-audiobooks-meta"></div>
+							<button type="button" id="sched-audiobooks-btn" class="btn btn-secondary btn-sm" onclick="runSyncNow('audiobooks')">▶ Run now</button>
+						</div>
+
                         <div class="form-section">
                             <div class="form-section-title">Plex Watchlist Sync</div>
                             <div class="form-group">
@@ -2601,7 +2611,7 @@
             if (rt.running) parts.push('<span style="color:#22c55e">● Running</span>');
             el.innerHTML = parts.join(' &nbsp;|&nbsp; ');
             // Sync button state with API
-            const jobMap = {'sched-movies-meta':'movies','sched-tv-meta':'tv','sched-wl-meta':'watchlist'};
+            const jobMap = {'sched-movies-meta':'movies','sched-tv-meta':'tv','sched-audiobooks-meta':'audiobooks','sched-wl-meta':'watchlist'};
             const job = jobMap[id];
             const btnEl = document.getElementById(id.replace('-meta', '-btn'));
             if (btnEl && job) {
@@ -2635,6 +2645,10 @@
             document.getElementById('sched-tv-time').value =
                 _toTimeInput(sched.tv_sync?.hour ?? 4, sched.tv_sync?.minute ?? 0);
 
+			setDayPicker('sched-audiobooks-days', sched.audiobooks_sync?.days_of_week || []);
+			document.getElementById('sched-audiobooks-time').value =
+				_toTimeInput(sched.audiobooks_sync?.hour ?? 2, sched.audiobooks_sync?.minute ?? 0);
+
             document.getElementById('sched-wl-interval').value =
                 sched.watchlist_sync?.interval_hours || 1;
 
@@ -2642,6 +2656,7 @@
 
             _renderMeta('sched-movies-meta', rt.movies);
             _renderMeta('sched-tv-meta', rt.tv);
+			_renderMeta('sched-audiobooks-meta', rt.audiobooks);
             _renderMeta('sched-wl-meta', rt.watchlist);
         }
 
@@ -2649,6 +2664,7 @@
             const status = document.getElementById('sched-save-status');
             const moviesDays = getDayPicker('sched-movies-days');
             const tvDays = getDayPicker('sched-tv-days');
+			const audiobookDays = getDayPicker('sched-audiobooks-days');
 
             const overlap = moviesDays.filter(d => tvDays.includes(d));
             if (overlap.length > 0) {
@@ -2660,6 +2676,7 @@
 
             const moviesTime = document.getElementById('sched-movies-time').value.split(':');
             const tvTime = document.getElementById('sched-tv-time').value.split(':');
+			const audiobookTime = document.getElementById('sched-audiobooks-time').value.split(':');
 
             const cfgRes = await fetch('/api/config');
             const data = await cfgRes.json();
@@ -2681,6 +2698,12 @@
                     hour: parseInt(tvTime[0]) || 4,
                     minute: parseInt(tvTime[1]) || 0
                 },
+				audiobooks_sync: {
+					enabled: audiobookDays.length > 0,
+					days_of_week: audiobookDays,
+					hour: parseInt(audiobookTime[0]) || 2,
+					minute: parseInt(audiobookTime[1]) || 0
+				},
                 watchlist_sync: {
                     enabled: true,
                     interval_hours: parseInt(document.getElementById('sched-wl-interval').value) || 1
@@ -2714,6 +2737,7 @@
         // Build pickers then load data
         buildDayPicker('sched-movies-days');
         buildDayPicker('sched-tv-days');
+		buildDayPicker('sched-audiobooks-days');
         loadScheduler();
         setInterval(loadScheduler, 30000);
 

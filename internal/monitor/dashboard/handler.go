@@ -74,11 +74,12 @@ func (h *Handler) Logs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	allowed := map[string]string{
-		"tiramisu":       "tiramisu.log",
-		"movies-sync":    "movies-sync.log",
-		"tv-sync":        "tv-sync.log",
-		"watchlist-sync": "watchlist-sync.log",
-		"music-sync":     "music-sync.log",
+		"tiramisu":        "tiramisu.log",
+		"movies-sync":     "movies-sync.log",
+		"tv-sync":         "tv-sync.log",
+		"watchlist-sync":  "watchlist-sync.log",
+		"music-sync":      "music-sync.log",
+		"audiobooks-sync": "audiobooks-sync.log",
 	}
 
 	file := r.URL.Query().Get("file")

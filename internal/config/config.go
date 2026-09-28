@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"tiramisu/internal/audiobookimport"
 	"tiramisu/internal/prowlarr"
 
 	"github.com/google/uuid"
@@ -115,11 +116,29 @@ func DefaultMusicDiscovery() MusicDiscoveryConfig {
 }
 
 type SchedulerConfig struct {
-	Enabled       bool                `json:"enabled"`
-	MoviesSync    DailyJobConfig      `json:"movies_sync"`
-	TVSync        DailyJobConfig      `json:"tv_sync"`
-	MusicSync     DailyJobConfig      `json:"music_sync"`
-	WatchlistSync WatchlistSyncConfig `json:"watchlist_sync"`
+	Enabled        bool                `json:"enabled"`
+	MoviesSync     DailyJobConfig      `json:"movies_sync"`
+	TVSync         DailyJobConfig      `json:"tv_sync"`
+	MusicSync      DailyJobConfig      `json:"music_sync"`
+	AudiobooksSync DailyJobConfig      `json:"audiobooks_sync"`
+	WatchlistSync  WatchlistSyncConfig `json:"watchlist_sync"`
+}
+
+// AudiobookConfig declares the native audiobook controller settings. Runtime
+// validation and dependency construction live in the audiobook job package.
+type AudiobookConfig struct {
+	Enabled                 bool                            `json:"enabled"`
+	AudioSiloURL            string                          `json:"audiosilo_url"`
+	AudioSiloToken          string                          `json:"audiosilo_token"`
+	AudiobookshelfURL       string                          `json:"audiobookshelf_url"`
+	AudiobookshelfToken     string                          `json:"audiobookshelf_token"`
+	AudiobookshelfLibraryID string                          `json:"audiobookshelf_library_id"`
+	StatePath               string                          `json:"state_path"`
+	RemovalPolicy           audiobookimport.RemovalPolicy   `json:"removal_policy"`
+	PaceSeconds             int                             `json:"pace_seconds"`
+	Limits                  audiobookimport.DiscoveryLimits `json:"limits"`
+	Categories              []int                           `json:"categories"`
+	IndexerIDs              []int                           `json:"indexer_ids"`
 }
 
 // EngineConfig holds per-engine paths for subprocess sync.
@@ -332,6 +351,9 @@ type Config struct {
 	// --- Built-in Sync Scheduler ---
 	Scheduler SchedulerConfig `json:"scheduler"`
 
+	// --- Audiobook discovery and publication controller ---
+	Audiobooks AudiobookConfig `json:"audiobooks"`
+
 	// --- Music Discovery (weekly sync) ---
 	MusicDiscovery MusicDiscoveryConfig `json:"music_discovery"`
 
@@ -422,11 +444,12 @@ func LoadConfig() Config {
 		},
 
 		Scheduler: SchedulerConfig{
-			Enabled:       false, // off by default — won't break installs using cron
-			MoviesSync:    DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
-			TVSync:        DailyJobConfig{Enabled: true, DaysOfWeek: []int{3, 5}, Hour: 4, Minute: 0},
-			MusicSync:     DailyJobConfig{Enabled: true, DaysOfWeek: []int{0}, Hour: 15, Minute: 0},
-			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
+			Enabled:        false, // off by default — won't break installs using cron
+			MoviesSync:     DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
+			TVSync:         DailyJobConfig{Enabled: true, DaysOfWeek: []int{3, 5}, Hour: 4, Minute: 0},
+			MusicSync:      DailyJobConfig{Enabled: true, DaysOfWeek: []int{0}, Hour: 15, Minute: 0},
+			AudiobooksSync: DailyJobConfig{Enabled: false},
+			WatchlistSync:  WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
 		},
 
 		MusicDiscovery: DefaultMusicDiscovery(),

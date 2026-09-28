@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"tiramisu/internal/audiobookjob"
 	"tiramisu/internal/cache"
 	"tiramisu/internal/catalog"
 	"tiramisu/internal/catalog/mediaserver"
@@ -5085,21 +5086,47 @@ func main() {
 	// what could collide with a user's own external cron setup.
 	{
 		schedCfg := scheduler.SchedulerConfig{
-			Enabled:       gc().Scheduler.Enabled,
-			MoviesSync:    scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
-			TVSync:        scheduler.DailyJobConfig(gc().Scheduler.TVSync),
-			MusicSync:     scheduler.DailyJobConfig(gc().Scheduler.MusicSync),
-			WatchlistSync: scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
+			Enabled:        gc().Scheduler.Enabled,
+			MoviesSync:     scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
+			TVSync:         scheduler.DailyJobConfig(gc().Scheduler.TVSync),
+			MusicSync:      scheduler.DailyJobConfig(gc().Scheduler.MusicSync),
+			AudiobooksSync: scheduler.DailyJobConfig(gc().Scheduler.AudiobooksSync),
+			WatchlistSync:  scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
 		}
 
 		statePath := filepath.Join(GetStateDir(), "scheduler_state.json")
 
 		logsDir := gc().LogDir
+		if gc().Audiobooks.Enabled || gc().Scheduler.AudiobooksSync.Enabled {
+			if err := audiobookjob.ValidateSchedule(gc().Scheduler.AudiobooksSync); err != nil {
+				log.Fatalf("invalid audiobook schedule")
+			}
+			if _, err := audiobookjob.BuildLiveDeps(context.Background(), audiobookjob.Config{
+				AudioSiloURL: gc().Audiobooks.AudioSiloURL, AudioSiloToken: gc().Audiobooks.AudioSiloToken,
+				AudiobookshelfURL: gc().Audiobooks.AudiobookshelfURL, AudiobookshelfToken: gc().Audiobooks.AudiobookshelfToken,
+				AudiobookshelfLibraryID: gc().Audiobooks.AudiobookshelfLibraryID,
+				LibraryURL:              fmt.Sprintf("http://127.0.0.1:%d", gc().MetricsPort), StatePath: gc().Audiobooks.StatePath,
+				RemovalPolicy: gc().Audiobooks.RemovalPolicy, ProwlarrCfg: gc().Prowlarr,
+				Categories: gc().Audiobooks.Categories, IndexerIDs: gc().Audiobooks.IndexerIDs,
+				Limits: gc().Audiobooks.Limits, PaceSeconds: gc().Audiobooks.PaceSeconds,
+			}); err != nil {
+				log.Fatalf("invalid audiobook controller configuration")
+			}
+		}
 
 		// Start midnight log truncation
 		engines.StartLogTruncator(logsDir, backgroundStopChan)
 
 		syncers := map[string]scheduler.Syncer{
+			"audiobooks": &audiobookjob.Syncer{Cfg: audiobookjob.Config{
+				AudioSiloURL: gc().Audiobooks.AudioSiloURL, AudioSiloToken: gc().Audiobooks.AudioSiloToken,
+				AudiobookshelfURL: gc().Audiobooks.AudiobookshelfURL, AudiobookshelfToken: gc().Audiobooks.AudiobookshelfToken,
+				AudiobookshelfLibraryID: gc().Audiobooks.AudiobookshelfLibraryID,
+				LibraryURL:              fmt.Sprintf("http://127.0.0.1:%d", gc().MetricsPort), StatePath: gc().Audiobooks.StatePath,
+				RemovalPolicy: gc().Audiobooks.RemovalPolicy, ProwlarrCfg: gc().Prowlarr,
+				Categories: gc().Audiobooks.Categories, IndexerIDs: gc().Audiobooks.IndexerIDs,
+				Limits: gc().Audiobooks.Limits, PaceSeconds: gc().Audiobooks.PaceSeconds,
+			}},
 			"movies": engines.NewMoviesSyncer(engines.MoviesSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
 				TMDBAPIKey:      gc().TMDBAPIKey,
