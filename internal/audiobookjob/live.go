@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	pathpkg "path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,7 +46,7 @@ func validateConfig(ctx context.Context, c Config) error {
 			return errors.New("audiobook limit outside supported range")
 		}
 	}
-	if l.Selection.MaxSourceBytes <= 0 || l.Selection.MaxSourceBytes > maxBytes || l.Selection.MaxReleaseSizeBytes <= 0 || l.Selection.MaxReleaseSizeBytes > maxBytes || l.Selection.MinSeeders < 0 || l.Selection.MinSeeders > maxCount || l.Selection.MinConfidence < 0 || l.Selection.MinConfidence > maxCount {
+	if l.Selection.MaxSourceBytes <= 0 || l.Selection.MaxSourceBytes > maxBytes || l.Selection.MaxReleaseSizeBytes <= 0 || l.Selection.MaxReleaseSizeBytes > maxBytes || l.Selection.MinSeeders < 0 || l.Selection.MinSeeders > maxCount || l.Selection.MinConfidence < 0 || l.Selection.MinConfidence > 6 {
 		return errors.New("audiobook selection limit outside supported range")
 	}
 	if c.PaceSeconds <= 0 || c.PaceSeconds > maxPaceSeconds || c.RemovalPolicy.ConsecutiveMissingThreshold <= 0 || c.RemovalPolicy.ConsecutiveMissingThreshold > maxCount || c.RemovalPolicy.Grace < 0 || c.RemovalPolicy.Grace > 3650*24*time.Hour {
@@ -275,11 +277,35 @@ func (c *libraryClient) Inspect(ctx context.Context, s audiobookimport.FetchedSo
 func (c *libraryClient) Add(ctx context.Context, r audiobookimport.LibraryPublishRequest) (audiobookimport.LibraryPublishResult, error) {
 	files := make([]library.AudioFileRequest, len(r.Files))
 	for i, f := range r.Files {
-		files[i] = library.AudioFileRequest{SourcePath: f.SourcePath, Path: f.Path, ExternalID: f.ExternalIdentity.ID, ExternalIDNamespace: f.ExternalIdentity.Namespace}
+		libraryPath, err := libraryPathWithHash(f.Path, r.Hash)
+		if err != nil {
+			return audiobookimport.LibraryPublishResult{}, errors.New("invalid audiobook library path")
+		}
+		files[i] = library.AudioFileRequest{SourcePath: f.SourcePath, Path: libraryPath, ExternalID: f.ExternalIdentity.ID, ExternalIDNamespace: f.ExternalIdentity.Namespace}
 	}
 	var out library.AudioAddResponse
 	e := c.post(ctx, "/api/library/add", library.AddRequest{Type: r.Type, Title: r.Title, Hash: r.Hash, Magnet: r.Magnet, TorrentFile: r.TorrentFile, Files: files, MetadataWait: 120}, &out)
 	return audiobookimport.LibraryPublishResult{AlreadyPresent: out.AlreadyPresent}, e
+}
+
+func libraryPathWithHash(value, hash string) (string, error) {
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if len(hash) < 8 {
+		return "", errors.New("invalid hash")
+	}
+	suffix := hash[len(hash)-8:]
+	if _, err := strconv.ParseUint(suffix, 16, 32); err != nil {
+		return "", errors.New("invalid hash")
+	}
+	ext := pathpkg.Ext(value)
+	if ext == "" {
+		return "", errors.New("missing extension")
+	}
+	stem := strings.TrimSuffix(value, ext)
+	if strings.HasSuffix(strings.ToLower(stem), "_"+suffix) {
+		return value, nil
+	}
+	return stem + "_" + suffix + ext, nil
 }
 func (c *libraryClient) Remove(ctx context.Context, r audiobookimport.LibraryRemoveRequest) error {
 	return c.post(ctx, "/api/library/remove", library.RemoveRequest{Type: r.Type, Prefix: r.Prefix}, nil)
